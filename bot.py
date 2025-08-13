@@ -55,6 +55,7 @@ def fetch_updates(offset=None):
     params = {}
     if offset is not None:
         params["offset"] = offset
+    # Gửi allowed_updates đúng chuẩn JSON
     params["allowed_updates"] = json.dumps(["message"])
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     r = requests.get(url, params=params, timeout=30)
@@ -70,6 +71,7 @@ def send_message(text):
     r.raise_for_status()
 
 def reply_to(msg, text):
+    """Reply ngay dưới tin nhắn gốc."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     params = {
         "chat_id": msg["chat"]["id"],
@@ -85,7 +87,7 @@ def iso_local(ts):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 def get_message_text(msg):
-    # ưu tiên text, sau đó caption; nếu không có -> ghi chú non-text
+    # Ưu tiên text, sau đó caption; nếu không có -> chuỗi rỗng
     return msg.get("text") or msg.get("caption") or ""
 
 def is_service_message(msg: dict) -> bool:
@@ -96,14 +98,16 @@ def is_service_message(msg: dict) -> bool:
     ]
     return any(k in msg for k in service_keys)
 
-# ---- VALIDATION: 8 số + " - " + chữ ----
+# ---- VALIDATION: 8 số + " - " + chữ (cho phép kèm số & khoảng trắng ở phần chữ) ----
 def is_valid_report(text: str) -> bool:
     """
     Hợp lệ khi:
-      - Bắt đầu bằng đúng 8 chữ số
+      - Bắt đầu đúng 8 chữ số
       - theo sau là ' - ' (dấu cách, gạch ngang, dấu cách)
-      - phần sau chỉ gồm chữ cái (kể cả có dấu) và khoảng trắng
-    Ví dụ: 23082025 - Kho Mien Dong 01
+      - phần sau chứa chữ cái (có thể có số và khoảng trắng). Yêu cầu có ÍT NHẤT 1 chữ cái.
+    Ví dụ hợp lệ:
+      23082025 - Kho Mien Dong
+      23082025 - Mien Dong 01
     """
     if not text:
         return False
@@ -111,8 +115,8 @@ def is_valid_report(text: str) -> bool:
     if not m:
         return False
     tail = m.group(2)
-    # Chỉ cho phép chữ & khoảng trắng (Unicode): isalpha() hỗ trợ tiếng Việt
-    return all(ch.isalpha() or ch.isspace() for ch in tail) and any(ch.isalpha() for ch in tail)
+    # Cho phép chữ, số, khoảng trắng; phải có ít nhất một chữ (isalpha) để tránh toàn số.
+    return any(ch.isalpha() for ch in tail) and all(ch.isalpha() or ch.isdigit() or ch.isspace() for ch in tail)
 
 # ---------- Main ----------
 def collect_once():
@@ -135,6 +139,7 @@ def collect_once():
             continue
 
         frm = msg.get("from", {}) or {}
+        # Bỏ qua bot (kể cả chính mình) và service messages
         if frm.get("is_bot") or is_service_message(msg):
             continue
 
@@ -143,20 +148,21 @@ def collect_once():
         text = get_message_text(msg)
         ts_local = iso_local(msg["date"])
 
-        # Lưu log vào Airtable (bất kể đúng/sai format)
-        tbl_messages.create({
-            "DateTime": ts_local,
-            "UserID": user_id,
-            "Username": username,
-            "Message": text if text else "<non-text message>"
-        })
-        created += 1
-
-        # Phản hồi theo format
         if is_valid_report(text):
+            # ✅ ĐÚNG format: LƯU vào Airtable và reply xác nhận
+            tbl_messages.create({
+                "DateTime": ts_local,
+                "UserID": user_id,
+                "Username": username,
+                "Message": text
+            })
+            created += 1
             ack = "Đã ghi nhận báo cáo 5s ngày hôm nay"
         else:
+            # ❌ SAI format: KHÔNG lưu Airtable, chỉ reply nhắc
             ack = "Kiểm tra lại format và gửi báo cáo lại"
+
+        # Trả lời ngay dưới tin nhắn gốc
         try:
             reply_to(msg, ack)
         except Exception as e:
@@ -169,6 +175,7 @@ def collect_once():
     return created
 
 def send_daily_report():
+    # Đếm UserID duy nhất của NGÀY HÔM NAY (giờ VN) trong các bản ghi HỢP LỆ
     today_prefix = datetime.now(VN_TZ).strftime("%Y-%m-%d")
     formula = f"SEARCH('{today_prefix}', {{DateTime}})"
     users = set()
