@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 from datetime import datetime, timezone
 from dateutil import tz
@@ -22,6 +23,7 @@ if not all([BOT_TOKEN, GROUP_ID, AIRTABLE_TOKEN, AIRTABLE_BASE_ID, TBL_MESSAGES,
 tbl_messages = Table(AIRTABLE_TOKEN, AIRTABLE_BASE_ID, TBL_MESSAGES)
 tbl_meta = Table(AIRTABLE_TOKEN, AIRTABLE_BASE_ID, TBL_META)
 
+# --- helpers ---
 def get_last_update_id():
     recs = tbl_meta.all(formula=match({"key": "last_update_id"}), page_size=1)
     if recs:
@@ -39,11 +41,21 @@ def set_last_update_id(value, rec_id=None):
         else:
             tbl_meta.create({"key": "last_update_id", "value": str(value)})
 
+def delete_webhook():
+    try:
+        requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+            params={"drop_pending_updates": False}, timeout=15
+        )
+    except Exception:
+        pass
+
 def fetch_updates(offset=None):
     params = {}
     if offset is not None:
         params["offset"] = offset
-    params["allowed_updates"] = ["message"]
+    # gửi allowed_updates đúng chuẩn JSON
+    params["allowed_updates"] = json.dumps(["message"])
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
@@ -57,11 +69,36 @@ def send_message(text):
     r = requests.get(url, params={"chat_id": GROUP_ID, "text": text}, timeout=30)
     r.raise_for_status()
 
+def reply_to(msg, text):
+    """Reply ngay dưới tin nhắn gốc."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    params = {
+        "chat_id": msg["chat"]["id"],
+        "text": text,
+        "reply_to_message_id": msg["message_id"],
+        "allow_sending_without_reply": True,
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+
 def iso_local(ts):
     dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(VN_TZ)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
+def get_message_text(msg):
+    # Ưu tiên text, sau đó caption; nếu không có -> ghi chú non-text
+    return msg.get("text") or msg.get("caption") or "<non-text message>"
+
+def is_service_message(msg: dict) -> bool:
+    service_keys = [
+        "new_chat_members","left_chat_member","new_chat_title","new_chat_photo",
+        "delete_chat_photo","group_chat_created","supergroup_chat_created",
+        "migrate_to_chat_id","migrate_from_chat_id","pinned_message"
+    ]
+    return any(k in msg for k in service_keys)
+
 def collect_once():
+    delete_webhook()  # phòng khi từng set webhook
     last_id, rec_id = get_last_update_id()
     updates = fetch_updates(offset=last_id + 1 if last_id else None)
     if not updates:
@@ -78,13 +115,19 @@ def collect_once():
             continue
         if str(msg["chat"]["id"]) != str(GROUP_ID):
             continue
+        # Bỏ qua bot (kể cả chính mình) và service messages
+        frm = msg.get("from", {}) or {}
+        if frm.get("is_bot"):
+            continue
+        if is_service_message(msg):
+            continue
 
-        user = msg.get("from", {})
-        user_id = str(user.get("id", ""))
-        username = user.get("username") or f"{user.get('first_name','')} {user.get('last_name','')}".strip() or ""
-        text = msg.get("text") or "<non-text message>"
+        user_id = str(frm.get("id", ""))
+        username = frm.get("username") or f"{frm.get('first_name','')} {frm.get('last_name','')}".strip() or ""
+        text = get_message_text(msg)
         ts_local = iso_local(msg["date"])
 
+        # Ghi Airtable
         tbl_messages.create({
             "DateTime": ts_local,
             "UserID": user_id,
@@ -92,6 +135,12 @@ def collect_once():
             "Message": text
         })
         created += 1
+
+        # Trả lời xác nhận ngay dưới tin nhắn
+        try:
+            reply_to(msg, "Đã ghi nhận báo cáo 5s ngày hôm nay")
+        except Exception as e:
+            print("Ack failed:", e)
 
     if max_update_id > last_id:
         set_last_update_id(max_update_id, rec_id)
@@ -121,3 +170,4 @@ if __name__ == "__main__":
         send_daily_report()
     else:
         raise SystemExit("Unknown MODE. Use collect or report.")
+
