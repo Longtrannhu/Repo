@@ -3,6 +3,7 @@ on:
   schedule:
     - cron: "*/5 * * * *"   # mỗi 5 phút (UTC)
   workflow_dispatch:
+
 jobs:
   collect:
     runs-on: ubuntu-latest
@@ -11,9 +12,31 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
         run: |
           pip install -r requirements.txt
+
+      # 👉 STEP 1: Debug xem secret có được bơm vào env chưa
+      - name: Debug env names
+        run: |
+          python - <<'PY'
+          import os
+          keys = ['BOT_TOKEN','GROUP_ID','AIRTABLE_TOKEN','AIRTABLE_BASE_ID','AIRTABLE_TABLE_MESSAGES','AIRTABLE_TABLE_META']
+          for k in keys:
+              print(k, '=>', 'OK' if os.getenv(k) else 'MISSING')
+          PY
+
+      # 👉 STEP 2: Sanity check quyền Airtable với bảng Meta
+      - name: Sanity check Airtable access
+        env:
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+        run: |
+          curl -s -o /dev/null -w "HTTP %{http_code}\n" \
+            -H "Authorization: Bearer $AIRTABLE_TOKEN" \
+            "https://api.airtable.com/v0/$AIRTABLE_BASE_ID/Meta?pageSize=1"
+
       - name: Run collector
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
