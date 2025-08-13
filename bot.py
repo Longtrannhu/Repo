@@ -55,7 +55,7 @@ def fetch_updates(offset=None):
     params = {}
     if offset is not None:
         params["offset"] = offset
-    # Gửi allowed_updates đúng chuẩn JSON
+    # gửi allowed_updates đúng chuẩn JSON
     params["allowed_updates"] = json.dumps(["message"])
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     r = requests.get(url, params=params, timeout=30)
@@ -87,7 +87,7 @@ def iso_local(ts):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 def get_message_text(msg):
-    # Ưu tiên text, sau đó caption; nếu không có -> chuỗi rỗng
+    # ưu tiên text, sau đó caption; nếu không có -> chuỗi rỗng
     return msg.get("text") or msg.get("caption") or ""
 
 def is_service_message(msg: dict) -> bool:
@@ -130,6 +130,10 @@ def collect_once():
     max_update_id = last_id
     created = 0
 
+    # Tách tin nhắn thường và album (media_group_id)
+    normal_msgs = []
+    media_groups = {}  # mgid -> list[message]
+
     for upd in updates:
         max_update_id = max(max_update_id, upd["update_id"])
         msg = upd.get("message")
@@ -137,19 +141,25 @@ def collect_once():
             continue
         if str(msg["chat"]["id"]) != str(GROUP_ID):
             continue
-
         frm = msg.get("from", {}) or {}
-        # Bỏ qua bot (kể cả chính mình) và service messages
         if frm.get("is_bot") or is_service_message(msg):
             continue
 
+        mgid = msg.get("media_group_id")
+        if mgid:
+            media_groups.setdefault(mgid, []).append(msg)
+        else:
+            normal_msgs.append(msg)
+
+    # Xử lý tin nhắn thường (text / 1 ảnh)
+    for msg in normal_msgs:
+        frm = msg.get("from", {}) or {}
         user_id = str(frm.get("id", ""))
         username = frm.get("username") or f"{frm.get('first_name','')} {frm.get('last_name','')}".strip() or ""
         text = get_message_text(msg)
         ts_local = iso_local(msg["date"])
 
         if is_valid_report(text):
-            # ✅ ĐÚNG format: LƯU vào Airtable và reply xác nhận
             tbl_messages.create({
                 "DateTime": ts_local,
                 "UserID": user_id,
@@ -159,12 +169,47 @@ def collect_once():
             created += 1
             ack = "Đã ghi nhận báo cáo 5s ngày hôm nay"
         else:
-            # ❌ SAI format: KHÔNG lưu Airtable, chỉ reply nhắc
             ack = "Kiểm tra lại format và gửi báo cáo lại"
 
-        # Trả lời ngay dưới tin nhắn gốc
         try:
             reply_to(msg, ack)
+        except Exception as e:
+            print("Ack failed:", e)
+
+    # Xử lý album nhiều ảnh: chỉ reply/lưu 1 lần theo caption của album
+    for mgid, msgs in media_groups.items():
+        # Chọn message đại diện: ưu tiên cái có caption; nếu không có thì lấy cái đầu
+        rep = None
+        caption = ""
+        for m in msgs:
+            cap = m.get("caption") or ""
+            if cap:
+                rep = m
+                caption = cap
+                break
+        if rep is None:
+            rep = msgs[0]  # reply vào ảnh đầu tiên nếu không có caption
+            caption = ""   # không caption => coi là sai format
+
+        frm = rep.get("from", {}) or {}
+        user_id = str(frm.get("id", ""))
+        username = frm.get("username") or f"{frm.get('first_name','')} {frm.get('last_name','')}".strip() or ""
+        ts_local = iso_local(rep["date"])
+
+        if is_valid_report(caption):
+            tbl_messages.create({
+                "DateTime": ts_local,
+                "UserID": user_id,
+                "Username": username,
+                "Message": caption
+            })
+            created += 1
+            ack = "Đã ghi nhận báo cáo 5s ngày hôm nay"
+        else:
+            ack = "Kiểm tra lại format và gửi báo cáo lại"
+
+        try:
+            reply_to(rep, ack)
         except Exception as e:
             print("Ack failed:", e)
 
