@@ -1,8 +1,8 @@
-# bot.py (V5) — Daily 21:00 VN, Collector mỗi 15', Bot realtime khi chạy --bot
+# bot.py (V6) — Daily 21:00 VN, Collector mỗi 15', phát hiện ảnh trùng theo file_unique_id
 import os, re, sys, json, logging
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -17,16 +17,18 @@ log = logging.getLogger("report-bot")
 
 # ----- ENV -----
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # ID nhóm nhận báo cáo / nơi auto-reply
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")  # ID nhóm nhận báo cáo / auto-reply
 
-AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
+AIRTABLE_TOKEN   = os.getenv("AIRTABLE_TOKEN")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-TBL_MESSAGES = os.getenv("TBL_MESSAGES", "Messages")
-TBL_META = os.getenv("TBL_META", "Meta")
+TBL_MESSAGES     = os.getenv("TBL_MESSAGES", "Messages")
+TBL_META         = os.getenv("TBL_META", "Meta")
+TBL_IMAGES       = os.getenv("TBL_IMAGES")  # (tuỳ chọn) bảng lưu dấu vết ảnh trùng; nếu không có sẽ dùng bảng Meta
 
 api = Api(AIRTABLE_TOKEN) if AIRTABLE_TOKEN else None
 tbl_messages = api.table(AIRTABLE_BASE_ID, TBL_MESSAGES) if api else None
-tbl_meta = api.table(AIRTABLE_BASE_ID, TBL_META) if api else None
+tbl_meta     = api.table(AIRTABLE_BASE_ID, TBL_META) if api else None
+tbl_images   = api.table(AIRTABLE_BASE_ID, TBL_IMAGES) if (api and TBL_IMAGES) else None  # có thì dùng
 
 VN_TZ = timezone(timedelta(hours=7))
 FORMAT_RE = re.compile(r"^\s*\d{8}\s*-\s*[^\s].+$", re.UNICODE)
@@ -85,7 +87,7 @@ def insert_message_record(chat_id, user_id, username, text, ok, msg_id, media_gr
         "UserID": str(user_id),
         "Username": username or "",
         "Message": text or "",
-        # Nếu bạn thêm cột sau này, có thể bật các dòng dưới:
+        # Có thể bật thêm các cột bên dưới nếu bảng của bạn có:
         # "chat_id": str(chat_id),
         # "message_id": str(msg_id),
         # "media_group_id": str(media_group_id) if media_group_id else "",
@@ -96,35 +98,61 @@ def insert_message_record(chat_id, user_id, username, text, ok, msg_id, media_gr
     except Exception as e:
         log.error("Insert to Airtable failed: %s", e)
 
-def meta_get(key: str):
-    """Trả về (value, record_id) nếu tìm thấy trong bảng Meta (cột key/Key, value/Value)."""
-    if not tbl_meta:
-        return None, None
-    try:
-        rec = tbl_meta.first(formula=match({"key": key})) or tbl_meta.first(formula=match({"Key": key}))
-        if rec:
-            f = safe_get_fields(rec)
-            val = f.get("value") or f.get("Value")
-            return val, rec.get("id")
-    except Exception as e:
-        log.warning("Meta get error: %s", e)
-    return None, None
+# --- Lưu/kiểm tra ảnh đã thấy trước đây ---
+def images_seen(uids: List[str]) -> Tuple[bool, List[str]]:
+    """
+    Trả về (has_any, existed_ids) — true nếu có ít nhất 1 uid đã từng lưu.
+    Ưu tiên dùng bảng TBL_IMAGES (nếu có). Nếu không, fallback lưu vào bảng Meta với key = 'img:<uid>'.
+    """
+    existed = []
+    if tbl_images:
+        for uid in set(uids):
+            try:
+                rec = tbl_images.first(formula=match({"file_unique_id": uid}))
+                if rec:
+                    existed.append(uid)
+            except Exception as e:
+                log.warning("images_seen check error: %s", e)
+    elif tbl_meta:
+        for uid in set(uids):
+            try:
+                rec = tbl_meta.first(formula=match({"key": f"img:{uid}"})) or tbl_meta.first(formula=match({"Key": f"img:{uid}"}))
+                if rec:
+                    existed.append(uid)
+            except Exception as e:
+                log.warning("meta images_seen error: %s", e)
+    return (len(existed) > 0, existed)
 
-def meta_upsert(key: str, value, rec_id: Optional[str] = None):
-    if not tbl_meta:
-        return
-    body = {"key": key, "value": str(value)}
-    try:
-        if rec_id:
-            tbl_meta.update(rec_id, body, replace=False)
-            return
-        rec = tbl_meta.first(formula=match({"key": key})) or tbl_meta.first(formula=match({"Key": key}))
-        if rec:
-            tbl_meta.update(rec["id"], body, replace=False)
-        else:
-            tbl_meta.create(body)
-    except Exception as e:
-        log.warning("Meta upsert error: %s", e)
+def save_images_fingerprints(uids: List[str], chat_id, user_id, caption: str, media_group_id, message_id):
+    """Lưu dấu vết ảnh để phát hiện trùng lần sau."""
+    unique = list(set(uids))
+    if tbl_images:
+        for uid in unique:
+            body = {
+                "file_unique_id": uid,
+                "DateTime": now_vn_iso(),
+                "chat_id": str(chat_id),
+                "user_id": str(user_id),
+                "caption": caption or "",
+                "media_group_id": str(media_group_id) if media_group_id else "",
+                "message_id": str(message_id),
+            }
+            try:
+                tbl_images.create(body)
+            except Exception as e:
+                log.warning("save_images_fingerprints error: %s", e)
+    elif tbl_meta:
+        for uid in unique:
+            key = f"img:{uid}"
+            try:
+                rec = tbl_meta.first(formula=match({"key": key})) or tbl_meta.first(formula=match({"Key": key}))
+                body = {"key": key, "value": now_vn_iso()}
+                if rec:
+                    tbl_meta.update(rec["id"], body, replace=False)
+                else:
+                    tbl_meta.create(body)
+            except Exception as e:
+                log.warning("meta save image error: %s", e)
 
 # ===== Telegram HTTP =====
 def _tg_api(method: str, payload: dict):
@@ -209,58 +237,131 @@ def send_daily_report():
     print(report_text)
     tg_send_message(TELEGRAM_CHAT_ID, report_text)
 
-# ===== Collector (quét getUpdates, trả lời rồi thoát) =====
+# ===== Collector (quét getUpdates, phát hiện ảnh trùng) =====
 def run_collector_once():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Missing secrets: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID", file=sys.stderr)
         sys.exit(1)
 
-    last_val, rec_id = meta_get("last_update_id")
+    # 1) Lấy offset cũ từ Meta
+    last_val, rec_id = meta_get("last_update_id") if tbl_meta else (None, None)
     try:
         offset = int(last_val) + 1 if (last_val is not None and str(last_val).isdigit()) else None
     except Exception:
         offset = None
 
+    # 2) getUpdates
     data = tg_get_updates(offset)
-    results = data.get("result", [])
-    processed_mgid = set()
-    last_update_id = None
+    updates = data.get("result", [])
 
-    for upd in results:
-        last_update_id = upd.get("update_id", last_update_id)
+    # 3) Gom theo nhóm media_group_id (None => single)
+    groups: Dict[str, List[dict]] = {}
+    for upd in updates:
         msg = upd.get("message") or {}
+        if not msg:
+            continue
         chat = msg.get("chat") or {}
         if str(chat.get("id")) != str(TELEGRAM_CHAT_ID):
             continue  # chỉ xử lý đúng nhóm
+        key = msg.get("media_group_id") or f"single:{msg.get('message_id')}"
+        groups.setdefault(key, []).append(msg)
 
-        text = msg.get("caption") or msg.get("text") or ""
-        mgid = msg.get("media_group_id")
-        if mgid and (mgid in processed_mgid):
-            continue  # cùng album – chỉ trả 1 lần
+    # 4) Xử lý từng nhóm
+    last_update_id = None
+    for upd in updates:
+        last_update_id = upd.get("update_id", last_update_id)
 
-        ok = is_valid_format(text)
-        user = msg.get("from") or {}
-        if ok:
-            insert_message_record(
-                chat_id=chat.get("id"),
-                user_id=user.get("id", 0),
-                username=user.get("username", ""),
-                text=text,
-                ok=True,
-                msg_id=msg.get("message_id"),
-                media_group_id=mgid,
-            )
-            tg_send_message(chat.get("id"), "Đã ghi nhận báo cáo 5s ngày hôm nay", reply_to=msg.get("message_id"))
+    for key, msgs in groups.items():
+        # caption: lấy caption/text đầu tiên có
+        caption = ""
+        for m in msgs:
+            caption = m.get("caption") or m.get("text") or caption
+            if caption:
+                break
+
+        # thu thập các file_unique_id ảnh
+        uids: List[str] = []
+        for m in msgs:
+            if "photo" in m and isinstance(m["photo"], list) and m["photo"]:
+                # lấy size lớn nhất (phần tử cuối)
+                uids.append(m["photo"][-1].get("file_unique_id"))
+            # (tuỳ chọn) tài liệu ảnh:
+            if "document" in m:
+                doc = m["document"]
+                mime = (doc.get("mime_type") or "")
+                if mime.startswith("image/"):
+                    uids.append(doc.get("file_unique_id"))
+        uids = [u for u in uids if u]
+
+        # Nếu có ảnh và có caption => kiểm tra trùng
+        is_album = not key.startswith("single:")
+        first_msg_id = msgs[0].get("message_id")
+        chat_id = msgs[0].get("chat", {}).get("id")
+        user = msgs[0].get("from") or {}
+        user_id = user.get("id", 0)
+        username = user.get("username", "")
+
+        if uids and caption:
+            has_dup, existed = images_seen(uids)
+            if has_dup:
+                tg_send_message(chat_id, "Ảnh gửi có dấu hiệu trùng với trước đây, nhờ kiểm tra lại", reply_to=first_msg_id)
+                # không ghi Messages, cũng không ghi fingerprints mới
+                continue
+            # không trùng -> xử lý flow bình thường
+            ok = is_valid_format(caption)
+            if ok:
+                insert_message_record(chat_id, user_id, username, caption, True, first_msg_id, msgs[0].get("media_group_id"))
+                tg_send_message(chat_id, "Đã ghi nhận báo cáo 5s ngày hôm nay", reply_to=first_msg_id)
+                save_images_fingerprints(uids, chat_id, user_id, caption, msgs[0].get("media_group_id"), first_msg_id)
+            else:
+                tg_send_message(chat_id, "Kiểm tra lại format và gửi báo cáo lại", reply_to=first_msg_id)
         else:
-            tg_send_message(chat.get("id"), "Kiểm tra lại format và gửi báo cáo lại", reply_to=msg.get("message_id"))
+            # không phải nhóm ảnh có caption → giữ behavior cũ cho text đơn lẻ
+            text = caption or (msgs[0].get("text") or "")
+            if not text:
+                continue
+            ok = is_valid_format(text)
+            if ok:
+                insert_message_record(chat_id, user_id, username, text, True, first_msg_id, msgs[0].get("media_group_id"))
+                tg_send_message(chat_id, "Đã ghi nhận báo cáo 5s ngày hôm nay", reply_to=first_msg_id)
+            else:
+                tg_send_message(chat_id, "Kiểm tra lại format và gửi báo cáo lại", reply_to=first_msg_id)
 
-        if mgid:
-            processed_mgid.add(mgid)
-
-    if last_update_id is not None:
+    # 5) Cập nhật offset
+    if last_update_id is not None and tbl_meta:
         meta_upsert("last_update_id", last_update_id, rec_id=rec_id)
 
-# ===== Bot realtime (chạy riêng khi --bot) =====
+# ===== Meta helpers =====
+def meta_get(key: str):
+    if not tbl_meta:
+        return None, None
+    try:
+        rec = tbl_meta.first(formula=match({"key": key})) or tbl_meta.first(formula=match({"Key": key}))
+        if rec:
+            f = safe_get_fields(rec)
+            val = f.get("value") or f.get("Value")
+            return val, rec.get("id")
+    except Exception as e:
+        log.warning("Meta get error: %s", e)
+    return None, None
+
+def meta_upsert(key: str, value, rec_id: Optional[str] = None):
+    if not tbl_meta:
+        return
+    body = {"key": key, "value": str(value)}
+    try:
+        if rec_id:
+            tbl_meta.update(rec_id, body, replace=False)
+            return
+        rec = tbl_meta.first(formula=match({"key": key})) or tbl_meta.first(formula=match({"Key": key}))
+        if rec:
+            tbl_meta.update(rec["id"], body, replace=False)
+        else:
+            tbl_meta.create(body)
+    except Exception as e:
+        log.warning("Meta upsert error: %s", e)
+
+# ===== Bot realtime (chỉ khi --bot) =====
 def run_bot_polling():
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN is required to run bot")
@@ -287,6 +388,7 @@ def run_bot_polling():
         chat = update.effective_chat
         user = update.effective_user
 
+        # Với realtime, chưa tải ảnh để tính hash; vẫn dựa vào flow cũ
         text = msg.caption if getattr(msg, "caption", None) else (msg.text or "")
         if not text:
             return
@@ -314,10 +416,10 @@ def run_bot_polling():
 
 # ===== Entrypoint =====
 if __name__ == "__main__":
-    in_actions = os.getenv("GITHUB_ACTIONS") == "true"
-    force_daily = ("--daily" in sys.argv) or (os.getenv("RUN_DAILY") == "1")
+    in_actions      = os.getenv("GITHUB_ACTIONS") == "true"
+    force_daily     = ("--daily" in sys.argv)     or (os.getenv("RUN_DAILY") == "1")
     force_collector = ("--collector" in sys.argv) or (os.getenv("RUN_COLLECTOR") == "1")
-    force_bot = ("--bot" in sys.argv)
+    force_bot       = ("--bot" in sys.argv)
 
     # Ưu tiên: --bot > --collector > --daily/in_actions > realtime
     if force_bot:
