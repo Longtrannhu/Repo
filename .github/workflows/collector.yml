@@ -1,12 +1,9 @@
 name: Telegram Collector
 
 on:
-  workflow_dispatch: {}           # cho phép chạy thủ công từ tab Actions
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 14 * * *"         # 21:00 VN = 14:00 UTC (đổi nếu muốn)
-  push:
-    paths:
-      - ".github/workflows/collector.yml"  # tự check cấu hình khi file này đổi
+    - cron: "*/15 * * * *"   # chạy mỗi 15 phút (UTC)
 
 permissions:
   contents: read
@@ -17,8 +14,8 @@ jobs:
 
     # Map secrets của bạn -> ENV mà bot.py cần
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}            # token bot
+      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}             # chat id (dạng -100...)
       AIRTABLE_TOKEN:     ${{ secrets.AIRTABLE_TOKEN }}
       AIRTABLE_BASE_ID:   ${{ secrets.AIRTABLE_BASE_ID }}
       TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }}
@@ -35,16 +32,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyairtable
 
-      - name: Verify env (debug)
-        run: |
-          python - <<'PY'
-          import os
-          for k in ["TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","AIRTABLE_TOKEN","AIRTABLE_BASE_ID","TBL_MESSAGES","TBL_META"]:
-              print(k, "=>", "OK" if os.getenv(k) else "MISSING")
-          PY
-
-      - name: Run collector (daily mode inside Actions)
+      - name: Run collector (bot.py tự vào chế độ daily khi chạy trong Actions)
         run: |
           set -e
-          python -u bot.py     # bot.py (V3) sẽ tự chạy chế độ daily trong Actions
+          python -u bot.py
+
 
