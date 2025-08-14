@@ -1,9 +1,9 @@
 name: Daily Report 21:00 VN
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}          # Cho phép chạy tay từ tab Actions
   schedule:
-    - cron: "0 14 * * *"  # 21:00 VN
+    - cron: "0 14 * * *"         # 21:00 VN = 14:00 UTC
 
 permissions:
   contents: read
@@ -12,13 +12,14 @@ jobs:
   report:
     runs-on: ubuntu-latest
 
+    # Map secrets của bạn -> ENV mà bot.py cần
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}           # ← map từ BOT_TOKEN
-      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}            # ← map từ GROUP_ID
+      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}            # token bot Telegram
+      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}             # chat id nhóm (dạng -100...)
       AIRTABLE_TOKEN:     ${{ secrets.AIRTABLE_TOKEN }}
       AIRTABLE_BASE_ID:   ${{ secrets.AIRTABLE_BASE_ID }}
-      TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }}  # hoặc "Messages"
-      TBL_META:           ${{ secrets.AIRTABLE_TABLE_META }}      # hoặc "Meta"
+      TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }}  # hoặc đổi thành "Messages"
+      TBL_META:           ${{ secrets.AIRTABLE_TABLE_META }}      # hoặc đổi thành "Meta"
 
     steps:
       - uses: actions/checkout@v4
@@ -31,15 +32,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyairtable
 
-      - name: Verify env (debug)
-        run: |
-          python - <<'PY'
-          import os
-          for k in ["TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","AIRTABLE_TOKEN","AIRTABLE_BASE_ID","TBL_MESSAGES","TBL_META"]:
-              print(k, "=>", "OK" if os.getenv(k) else "MISSING")
-          PY
-
-      - name: Run report
+      - name: Run report (bot.py auto vào chế độ daily trong Actions)
         run: |
           set -e
           python -u bot.py
+
