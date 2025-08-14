@@ -1,4 +1,4 @@
-# bot.py (V3) — Mặc định chạy daily khi ở GitHub Actions
+# bot.py (V4) — Daily report khớp bảng DateTime/UserID/Username/Message
 import os
 import re
 import sys
@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from typing import List, Dict, Optional
 
 from pyairtable import Api  # chỉ cần pyairtable cho chế độ daily
 
@@ -31,6 +32,7 @@ tbl_messages = api.table(AIRTABLE_BASE_ID, TBL_MESSAGES) if api else None
 tbl_meta = api.table(AIRTABLE_BASE_ID, TBL_META) if api else None  # nếu cần
 
 VN_TZ = timezone(timedelta(hours=7))
+# Format hợp lệ: 8 số + " - " + chữ
 FORMAT_RE = re.compile(r"^\s*\d{8}\s*-\s*[^\s].+$", re.UNICODE)
 
 # Dùng khi chạy bot realtime để tránh reply nhiều lần cho 1 album
@@ -56,19 +58,55 @@ def safe_get_fields(rec) -> dict:
                 return r.get("fields", {}) or {}
     raise TypeError(f"Unexpected record type: {type(rec)}")
 
-def insert_message_record(chat_id, user_id, username, text, ok, msg_id, media_group_id):
+def _parse_any_dt(s: str) -> Optional[datetime]:
+    """Parse nhiều định dạng thời gian. Naive → coi như giờ VN."""
+    if not s:
+        return None
+    s = str(s).strip()
+    # ISO (có/không có Z)
+    try:
+        if s.endswith("Z"):
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return datetime.fromisoformat(s)
+    except Exception:
+        pass
+    # 2025-08-13 17:12:22, 13/08/2025 17:12:22, ...
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
+                "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S",
+                "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=VN_TZ)
+        except Exception:
+            continue
+    return None
+
+def _pick_text(fields: dict) -> str:
+    for k in ("text", "Text", "message", "Message", "caption", "Caption"):
+        if k in fields and fields[k]:
+            return str(fields[k])
+    return ""
+
+def insert_message_record(
+    chat_id, user_id, username, text, ok, msg_id, media_group_id
+):
+    """Chỉ ghi những cột có trong bảng hiện tại của bạn: DateTime, UserID, Username, Message.
+       (Không chèn is_valid để giữ đúng schema; nếu bạn muốn thêm, bật dòng tương ứng bên dưới.)"""
     if not tbl_messages:
         log.warning("Airtable not configured; skip insert")
         return
+    if not ok:
+        return  # không ghi nếu sai format
+
     fields = {
-        "chat_id": str(chat_id),
-        "user_id": str(user_id),
-        "username": username or "",
-        "text": text or "",
-        "is_valid": bool(ok),
-        "message_id": str(msg_id),
-        "media_group_id": str(media_group_id) if media_group_id else "",
-        "created_at": now_vn_iso(),
+        "DateTime": now_vn_iso(),
+        "UserID": str(user_id),
+        "Username": username or "",
+        "Message": text or "",
+        # "is_valid": True,          # nếu muốn thêm cột này thì bỏ comment
+        # Có thể thêm các cột khác nếu bảng bạn đã có sẵn:
+        # "chat_id": str(chat_id),
+        # "message_id": str(msg_id),
+        # "media_group_id": str(media_group_id) if media_group_id else "",
     }
     try:
         tbl_messages.create(fields)
@@ -90,8 +128,12 @@ def send_tg_message_http(token: str, chat_id: str, text: str):
         log.error("Telegram URLError: %s", e)
         raise
 
-# -------------------- Daily Report --------------------
-def fetch_today_records() -> list[dict]:
+# -------------------- Daily Report (đÃ CHỈNH THEO BẢNG CỦA BẠN) --------------------
+def fetch_today_records() -> List[Dict]:
+    """
+    Lấy record trong ngày (giờ VN) từ bảng Messages.
+    Tự nhận diện cột thời gian: created_at → DateTime → datetime → Created At → createdTime.
+    """
     if not tbl_messages:
         log.warning("Airtable not configured; cannot fetch today records")
         return []
@@ -100,39 +142,65 @@ def fetch_today_records() -> list[dict]:
     today_end = today_start + timedelta(days=1)
 
     try:
-        # Lấy rộng rồi lọc client-side theo created_at (ISO string)
         records = tbl_messages.all(page_size=100, max_records=1000)
     except Exception as e:
         log.error("Airtable fetch failed: %s", e)
         return []
 
-    results = []
+    results: List[Dict] = []
     for rec in records:
-        try:
-            fields = safe_get_fields(rec)
-            created = fields.get("created_at")
-            if not created:
-                continue
-            try:
-                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-            except Exception:
-                continue
-            dt_vn = dt.astimezone(VN_TZ)
-            if today_start <= dt_vn < today_end:
-                results.append(rec)
-        except Exception as e:
-            log.warning("Skip bad record shape: %s", e)
+        fields = safe_get_fields(rec)
+
+        # chọn nguồn thời gian: created_at → DateTime → ... → createdTime
+        ts = (
+            fields.get("created_at")
+            or fields.get("DateTime")
+            or fields.get("datetime")
+            or fields.get("Created At")
+            or rec.get("createdTime")
+        )
+
+        dt = _parse_any_dt(ts) if ts else None
+        if not dt:
+            continue
+
+        # nếu dt không có tz, coi là VN
+        if not dt.tzinfo:
+            dt = dt.replace(tzinfo=VN_TZ)
+
+        dt_vn = dt.astimezone(VN_TZ)
+        if today_start <= dt_vn < today_end:
+            results.append(rec)
     return results
 
-def build_summary(records: list[dict]) -> str:
+def build_summary(records: List[Dict]) -> str:
+    """
+    Tạo báo cáo tổng hợp:
+    - Nếu có cột is_valid thì dùng luôn.
+    - Nếu không, tự tính hợp lệ từ trường nội dung (text/Message/message/caption).
+    """
     total = 0
     by_chat = defaultdict(int)
+
     for rec in records:
         f = safe_get_fields(rec)
-        if not f.get("is_valid"):
+
+        if "is_valid" in f:
+            ok = bool(f.get("is_valid"))
+        else:
+            ok = is_valid_format(_pick_text(f))
+
+        if not ok:
             continue
+
         total += 1
-        by_chat[f.get("chat_id", "unknown")] += 1
+        cid = (
+            f.get("chat_id")
+            or f.get("ChatID")
+            or f.get("Chat Id")
+            or "unknown"
+        )
+        by_chat[str(cid)] += 1
 
     lines = [f"BÁO CÁO 5S - {datetime.now(VN_TZ).strftime('%d/%m/%Y')}"]
     lines.append(f"Tổng báo cáo hợp lệ: {total}")
@@ -206,16 +274,16 @@ def run_bot_polling():
 
 # -------------------- Entrypoint --------------------
 if __name__ == "__main__":
-    # CÁCH 2: Mặc định chạy daily khi ở GitHub Actions
+    # Mặc định chạy daily khi ở GitHub Actions
     in_actions = os.getenv("GITHUB_ACTIONS") == "true"
     force_daily = ("--daily" in sys.argv) or (os.getenv("RUN_DAILY") == "1")
     force_bot = ("--bot" in sys.argv)
 
     # Ưu tiên:
-    #   1) --bot  => chạy bot realtime
-    #   2) --daily hoặc RUN_DAILY=1 => daily
-    #   3) Nếu ở GitHub Actions => daily
-    #   4) Mặc định local => bot realtime
+    # 1) --bot => chạy bot realtime
+    # 2) --daily hoặc RUN_DAILY=1 => daily
+    # 3) Nếu ở GitHub Actions => daily
+    # 4) Mặc định local => bot realtime
     if force_bot:
         run_bot_polling()
     elif force_daily or in_actions:
