@@ -3,8 +3,7 @@ name: Daily Report 21:00 VN
 on:
   workflow_dispatch:
   schedule:
-    # 21:00 VN = 14:00 UTC
-    - cron: "0 14 * * *"
+    - cron: "0 14 * * *"  # 21:00 VN
 
 permissions:
   contents: read
@@ -13,14 +12,13 @@ jobs:
   report:
     runs-on: ubuntu-latest
 
-    # Map secrets -> env dùng cho tất cả các step
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
-      AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
-      TBL_MESSAGES: "Messages"
-      TBL_META: "Meta"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}           # ← map từ BOT_TOKEN
+      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}            # ← map từ GROUP_ID
+      AIRTABLE_TOKEN:     ${{ secrets.AIRTABLE_TOKEN }}
+      AIRTABLE_BASE_ID:   ${{ secrets.AIRTABLE_BASE_ID }}
+      TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }}  # hoặc "Messages"
+      TBL_META:           ${{ secrets.AIRTABLE_TABLE_META }}      # hoặc "Meta"
 
     steps:
       - uses: actions/checkout@v4
@@ -33,12 +31,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyairtable
 
-      # Step debug: để chắc chắn env đã có
       - name: Verify env (debug)
         run: |
           python - <<'PY'
           import os
-          for k in ["TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","AIRTABLE_TOKEN","AIRTABLE_BASE_ID"]:
+          for k in ["TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","AIRTABLE_TOKEN","AIRTABLE_BASE_ID","TBL_MESSAGES","TBL_META"]:
               print(k, "=>", "OK" if os.getenv(k) else "MISSING")
           PY
 
