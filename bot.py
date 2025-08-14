@@ -1,4 +1,4 @@
-# bot.py (V6) — Daily 21:00 VN, Collector mỗi 15', phát hiện ảnh trùng theo file_unique_id
+# bot.py (V6.1) — thêm icon cho các câu trả lời
 import os, re, sys, json, logging
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
@@ -17,23 +17,28 @@ log = logging.getLogger("report-bot")
 
 # ----- ENV -----
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")  # ID nhóm nhận báo cáo / auto-reply
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 AIRTABLE_TOKEN   = os.getenv("AIRTABLE_TOKEN")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
 TBL_MESSAGES     = os.getenv("TBL_MESSAGES", "Messages")
 TBL_META         = os.getenv("TBL_META", "Meta")
-TBL_IMAGES       = os.getenv("TBL_IMAGES")  # (tuỳ chọn) bảng lưu dấu vết ảnh trùng; nếu không có sẽ dùng bảng Meta
+TBL_IMAGES       = os.getenv("TBL_IMAGES")  # optional
 
 api = Api(AIRTABLE_TOKEN) if AIRTABLE_TOKEN else None
 tbl_messages = api.table(AIRTABLE_BASE_ID, TBL_MESSAGES) if api else None
 tbl_meta     = api.table(AIRTABLE_BASE_ID, TBL_META) if api else None
-tbl_images   = api.table(AIRTABLE_BASE_ID, TBL_IMAGES) if (api and TBL_IMAGES) else None  # có thì dùng
+tbl_images   = api.table(AIRTABLE_BASE_ID, TBL_IMAGES) if (api and TBL_IMAGES) else None
 
 VN_TZ = timezone(timedelta(hours=7))
 FORMAT_RE = re.compile(r"^\s*\d{8}\s*-\s*[^\s].+$", re.UNICODE)
 
-# tránh reply nhiều lần cho 1 album (khi chạy realtime/collector trong 1 lần quét)
+# === Reply texts (đÃ thay icon) ===
+MSG_OK       = "🆗Đã ghi nhận báo cáo 5s ngày hôm nay"
+MSG_DUP_IMG  = "⛔️Ảnh gửi có dấu hiệu trùng với trước đây, nhờ kiểm tra lại"
+MSG_BAD_FMT  = "🆕Kiểm tra lại format và gửi báo cáo lại"
+
+# tránh reply nhiều lần cho 1 album trong 1 vòng xử lý
 PROCESSED_MEDIA_GROUP_IDS = set()
 
 # ===== Utils =====
@@ -79,7 +84,6 @@ def _pick_text(fields: dict) -> str:
 
 # ===== Airtable IO =====
 def insert_message_record(chat_id, user_id, username, text, ok, msg_id, media_group_id):
-    """Chỉ ghi khi ĐÚNG format; map theo schema bảng hiện tại: DateTime/UserID/Username/Message."""
     if not (tbl_messages and ok):
         return
     fields = {
@@ -87,11 +91,7 @@ def insert_message_record(chat_id, user_id, username, text, ok, msg_id, media_gr
         "UserID": str(user_id),
         "Username": username or "",
         "Message": text or "",
-        # Có thể bật thêm các cột bên dưới nếu bảng của bạn có:
-        # "chat_id": str(chat_id),
-        # "message_id": str(msg_id),
-        # "media_group_id": str(media_group_id) if media_group_id else "",
-        # "is_valid": True,
+        # có thể bổ sung các cột khác nếu bảng có sẵn
     }
     try:
         tbl_messages.create(fields)
@@ -100,10 +100,6 @@ def insert_message_record(chat_id, user_id, username, text, ok, msg_id, media_gr
 
 # --- Lưu/kiểm tra ảnh đã thấy trước đây ---
 def images_seen(uids: List[str]) -> Tuple[bool, List[str]]:
-    """
-    Trả về (has_any, existed_ids) — true nếu có ít nhất 1 uid đã từng lưu.
-    Ưu tiên dùng bảng TBL_IMAGES (nếu có). Nếu không, fallback lưu vào bảng Meta với key = 'img:<uid>'.
-    """
     existed = []
     if tbl_images:
         for uid in set(uids):
@@ -124,7 +120,6 @@ def images_seen(uids: List[str]) -> Tuple[bool, List[str]]:
     return (len(existed) > 0, existed)
 
 def save_images_fingerprints(uids: List[str], chat_id, user_id, caption: str, media_group_id, message_id):
-    """Lưu dấu vết ảnh để phát hiện trùng lần sau."""
     unique = list(set(uids))
     if tbl_images:
         for uid in unique:
@@ -243,18 +238,15 @@ def run_collector_once():
         print("Missing secrets: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID", file=sys.stderr)
         sys.exit(1)
 
-    # 1) Lấy offset cũ từ Meta
     last_val, rec_id = meta_get("last_update_id") if tbl_meta else (None, None)
     try:
         offset = int(last_val) + 1 if (last_val is not None and str(last_val).isdigit()) else None
     except Exception:
         offset = None
 
-    # 2) getUpdates
     data = tg_get_updates(offset)
     updates = data.get("result", [])
 
-    # 3) Gom theo nhóm media_group_id (None => single)
     groups: Dict[str, List[dict]] = {}
     for upd in updates:
         msg = upd.get("message") or {}
@@ -262,30 +254,25 @@ def run_collector_once():
             continue
         chat = msg.get("chat") or {}
         if str(chat.get("id")) != str(TELEGRAM_CHAT_ID):
-            continue  # chỉ xử lý đúng nhóm
+            continue
         key = msg.get("media_group_id") or f"single:{msg.get('message_id')}"
         groups.setdefault(key, []).append(msg)
 
-    # 4) Xử lý từng nhóm
     last_update_id = None
     for upd in updates:
         last_update_id = upd.get("update_id", last_update_id)
 
     for key, msgs in groups.items():
-        # caption: lấy caption/text đầu tiên có
         caption = ""
         for m in msgs:
             caption = m.get("caption") or m.get("text") or caption
             if caption:
                 break
 
-        # thu thập các file_unique_id ảnh
         uids: List[str] = []
         for m in msgs:
             if "photo" in m and isinstance(m["photo"], list) and m["photo"]:
-                # lấy size lớn nhất (phần tử cuối)
                 uids.append(m["photo"][-1].get("file_unique_id"))
-            # (tuỳ chọn) tài liệu ảnh:
             if "document" in m:
                 doc = m["document"]
                 mime = (doc.get("mime_type") or "")
@@ -293,8 +280,6 @@ def run_collector_once():
                     uids.append(doc.get("file_unique_id"))
         uids = [u for u in uids if u]
 
-        # Nếu có ảnh và có caption => kiểm tra trùng
-        is_album = not key.startswith("single:")
         first_msg_id = msgs[0].get("message_id")
         chat_id = msgs[0].get("chat", {}).get("id")
         user = msgs[0].get("from") or {}
@@ -304,30 +289,26 @@ def run_collector_once():
         if uids and caption:
             has_dup, existed = images_seen(uids)
             if has_dup:
-                tg_send_message(chat_id, "Ảnh gửi có dấu hiệu trùng với trước đây, nhờ kiểm tra lại", reply_to=first_msg_id)
-                # không ghi Messages, cũng không ghi fingerprints mới
+                tg_send_message(chat_id, MSG_DUP_IMG, reply_to=first_msg_id)
                 continue
-            # không trùng -> xử lý flow bình thường
             ok = is_valid_format(caption)
             if ok:
                 insert_message_record(chat_id, user_id, username, caption, True, first_msg_id, msgs[0].get("media_group_id"))
-                tg_send_message(chat_id, "Đã ghi nhận báo cáo 5s ngày hôm nay", reply_to=first_msg_id)
+                tg_send_message(chat_id, MSG_OK, reply_to=first_msg_id)
                 save_images_fingerprints(uids, chat_id, user_id, caption, msgs[0].get("media_group_id"), first_msg_id)
             else:
-                tg_send_message(chat_id, "Kiểm tra lại format và gửi báo cáo lại", reply_to=first_msg_id)
+                tg_send_message(chat_id, MSG_BAD_FMT, reply_to=first_msg_id)
         else:
-            # không phải nhóm ảnh có caption → giữ behavior cũ cho text đơn lẻ
             text = caption or (msgs[0].get("text") or "")
             if not text:
                 continue
             ok = is_valid_format(text)
             if ok:
                 insert_message_record(chat_id, user_id, username, text, True, first_msg_id, msgs[0].get("media_group_id"))
-                tg_send_message(chat_id, "Đã ghi nhận báo cáo 5s ngày hôm nay", reply_to=first_msg_id)
+                tg_send_message(chat_id, MSG_OK, reply_to=first_msg_id)
             else:
-                tg_send_message(chat_id, "Kiểm tra lại format và gửi báo cáo lại", reply_to=first_msg_id)
+                tg_send_message(chat_id, MSG_BAD_FMT, reply_to=first_msg_id)
 
-    # 5) Cập nhật offset
     if last_update_id is not None and tbl_meta:
         meta_upsert("last_update_id", last_update_id, rec_id=rec_id)
 
@@ -388,7 +369,6 @@ def run_bot_polling():
         chat = update.effective_chat
         user = update.effective_user
 
-        # Với realtime, chưa tải ảnh để tính hash; vẫn dựa vào flow cũ
         text = msg.caption if getattr(msg, "caption", None) else (msg.text or "")
         if not text:
             return
@@ -404,9 +384,9 @@ def run_bot_polling():
                 msg_id=msg.id,
                 media_group_id=msg.media_group_id,
             )
-            await reply_once_for_media_group(update, context, "Đã ghi nhận báo cáo 5s ngày hôm nay")
+            await reply_once_for_media_group(update, context, MSG_OK)
         else:
-            await reply_once_for_media_group(update, context, "Kiểm tra lại format và gửi báo cáo lại")
+            await reply_once_for_media_group(update, context, MSG_BAD_FMT)
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
@@ -421,7 +401,6 @@ if __name__ == "__main__":
     force_collector = ("--collector" in sys.argv) or (os.getenv("RUN_COLLECTOR") == "1")
     force_bot       = ("--bot" in sys.argv)
 
-    # Ưu tiên: --bot > --collector > --daily/in_actions > realtime
     if force_bot:
         run_bot_polling()
     elif force_collector:
