@@ -1,9 +1,9 @@
 name: Daily Report 21:00 VN
 
 on:
-  workflow_dispatch: {}          # Cho phép chạy tay từ tab Actions
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 14 * * *"         # 21:00 VN = 14:00 UTC
+    - cron: "0 14 * * *"   # 21:00 VN = 14:00 UTC
 
 permissions:
   contents: read
@@ -11,29 +11,22 @@ permissions:
 jobs:
   report:
     runs-on: ubuntu-latest
-
-    # Map secrets của bạn -> ENV mà bot.py cần
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}            # token bot Telegram
-      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}             # chat id nhóm (dạng -100...)
+      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}
       AIRTABLE_TOKEN:     ${{ secrets.AIRTABLE_TOKEN }}
       AIRTABLE_BASE_ID:   ${{ secrets.AIRTABLE_BASE_ID }}
-      TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }}  # hoặc đổi thành "Messages"
-      TBL_META:           ${{ secrets.AIRTABLE_TABLE_META }}      # hoặc đổi thành "Meta"
-
+      TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }}
+      TBL_META:           ${{ secrets.AIRTABLE_TABLE_META }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
+        with: { python-version: "3.11" }
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install pyairtable
-
-      - name: Run report (bot.py auto vào chế độ daily trong Actions)
+      - name: Run report
         run: |
           set -e
-          python -u bot.py
-
+          python -u bot.py --daily
