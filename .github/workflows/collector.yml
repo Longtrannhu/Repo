@@ -1,12 +1,15 @@
-name: Telegram Collector
-on:
-  schedule:
-    - cron: "*/5 * * * *"   # mỗi 5 phút (UTC)
-  workflow_dispatch:
-
 jobs:
   collect:
     runs-on: ubuntu-latest
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}      # map từ BOT_TOKEN
+      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}       # map từ GROUP_ID
+      AIRTABLE_TOKEN:     ${{ secrets.AIRTABLE_TOKEN }}
+      AIRTABLE_BASE_ID:   ${{ secrets.AIRTABLE_BASE_ID }}
+      TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }}  # hoặc "Messages"
+      TBL_META:           ${{ secrets.AIRTABLE_TABLE_META }}      # hoặc "Meta"
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -15,36 +18,22 @@ jobs:
 
       - name: Install deps
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install pyairtable
 
-      # 👉 STEP 1: Debug xem secret có được bơm vào env chưa
-      - name: Debug env names
+      # (tuỳ chọn) kiểm tra env đã nhận
+      - name: Verify env
         run: |
           python - <<'PY'
           import os
-          keys = ['BOT_TOKEN','GROUP_ID','AIRTABLE_TOKEN','AIRTABLE_BASE_ID','AIRTABLE_TABLE_MESSAGES','AIRTABLE_TABLE_META']
-          for k in keys:
-              print(k, '=>', 'OK' if os.getenv(k) else 'MISSING')
+          for k in ["TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","AIRTABLE_TOKEN","AIRTABLE_BASE_ID"]:
+              print(k, "=>", "OK" if os.getenv(k) else "MISSING")
           PY
 
-      # 👉 STEP 2: Sanity check quyền Airtable với bảng Meta
-      - name: Sanity check Airtable access
-        env:
-          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
-          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
-        run: |
-          curl -s -o /dev/null -w "HTTP %{http_code}\n" \
-            -H "Authorization: Bearer $AIRTABLE_TOKEN" \
-            "https://api.airtable.com/v0/$AIRTABLE_BASE_ID/Meta?pageSize=1"
-
       - name: Run collector
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          GROUP_ID: ${{ secrets.GROUP_ID }}
-          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
-          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
-          AIRTABLE_TABLE_MESSAGES: ${{ secrets.AIRTABLE_TABLE_MESSAGES }}
-          AIRTABLE_TABLE_META: ${{ secrets.AIRTABLE_TABLE_META }}
-          MODE: collect
         run: |
-          python bot.py
+          set -e
+          python -u bot.py        # bot.py tự vào chế độ daily khi chạy trong Actions
+          # nếu bạn MUỐN chạy bot realtime trong workflow này thì:
+          # pip install python-telegram-bot==20.6
+          # python -u bot.py --bot
