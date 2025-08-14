@@ -1,14 +1,28 @@
+name: Telegram Collector
+
+on:
+  workflow_dispatch: {}           # cho phép chạy thủ công từ tab Actions
+  schedule:
+    - cron: "0 14 * * *"         # 21:00 VN = 14:00 UTC (đổi nếu muốn)
+  push:
+    paths:
+      - ".github/workflows/collector.yml"  # tự check cấu hình khi file này đổi
+
+permissions:
+  contents: read
+
 jobs:
   collect:
     runs-on: ubuntu-latest
 
+    # Map secrets của bạn -> ENV mà bot.py cần
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}      # map từ BOT_TOKEN
-      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}       # map từ GROUP_ID
+      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}
       AIRTABLE_TOKEN:     ${{ secrets.AIRTABLE_TOKEN }}
       AIRTABLE_BASE_ID:   ${{ secrets.AIRTABLE_BASE_ID }}
-      TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }}  # hoặc "Messages"
-      TBL_META:           ${{ secrets.AIRTABLE_TABLE_META }}      # hoặc "Meta"
+      TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }}
+      TBL_META:           ${{ secrets.AIRTABLE_TABLE_META }}
 
     steps:
       - uses: actions/checkout@v4
@@ -21,19 +35,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyairtable
 
-      # (tuỳ chọn) kiểm tra env đã nhận
-      - name: Verify env
+      - name: Verify env (debug)
         run: |
           python - <<'PY'
           import os
-          for k in ["TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","AIRTABLE_TOKEN","AIRTABLE_BASE_ID"]:
+          for k in ["TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","AIRTABLE_TOKEN","AIRTABLE_BASE_ID","TBL_MESSAGES","TBL_META"]:
               print(k, "=>", "OK" if os.getenv(k) else "MISSING")
           PY
 
-      - name: Run collector
+      - name: Run collector (daily mode inside Actions)
         run: |
           set -e
-          python -u bot.py        # bot.py tự vào chế độ daily khi chạy trong Actions
-          # nếu bạn MUỐN chạy bot realtime trong workflow này thì:
-          # pip install python-telegram-bot==20.6
-          # python -u bot.py --bot
+          python -u bot.py     # bot.py (V3) sẽ tự chạy chế độ daily trong Actions
+
