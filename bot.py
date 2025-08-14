@@ -1,243 +1,294 @@
+# bot.py
 import os
 import re
+import sys
 import json
-import requests
-from datetime import datetime, timezone
-from dateutil import tz
-from pyairtable import Table
+import time
+import logging
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+
+from pyairtable import Api
 from pyairtable.formulas import match
 
-# ==== ENV ====
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_ID = os.getenv("GROUP_ID")  # ví dụ: -1001234567890
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+# -------------------- Config & Globals --------------------
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("report-bot")
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # nơi nhận báo cáo hằng ngày
+
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-TBL_MESSAGES = os.getenv("AIRTABLE_TABLE_MESSAGES", "Messages")
-TBL_META = os.getenv("AIRTABLE_TABLE_META", "Meta")
+TBL_MESSAGES = os.getenv("TBL_MESSAGES", "Messages")
+TBL_META = os.getenv("TBL_META", "Meta")
 
-VN_TZ = tz.gettz("Asia/Ho_Chi_Minh")
+if not TELEGRAM_BOT_TOKEN:
+    log.warning("Missing TELEGRAM_BOT_TOKEN")
 
-if not all([BOT_TOKEN, GROUP_ID, AIRTABLE_TOKEN, AIRTABLE_BASE_ID, TBL_MESSAGES, TBL_META]):
-    raise RuntimeError("Missing required environment variables.")
+if not AIRTABLE_TOKEN or not AIRTABLE_BASE_ID:
+    log.warning("Missing Airtable credentials")
 
-# ==== Airtable tables ====
-tbl_messages = Table(AIRTABLE_TOKEN, AIRTABLE_BASE_ID, TBL_MESSAGES)
-tbl_meta = Table(AIRTABLE_TOKEN, AIRTABLE_BASE_ID, TBL_META)
+api = Api(AIRTABLE_TOKEN) if AIRTABLE_TOKEN else None
+tbl_messages = api.table(AIRTABLE_BASE_ID, TBL_MESSAGES) if api else None
+tbl_meta = api.table(AIRTABLE_BASE_ID, TBL_META) if api else None
 
-# ---------- Helpers ----------
-def get_last_update_id():
-    recs = tbl_meta.all(formula=match({"key": "last_update_id"}), page_size=1)
-    if recs:
-        return int(recs[0]["fields"].get("value", "0") or "0"), recs[0]["id"]
-    rec = tbl_meta.create({"key": "last_update_id", "value": "0"})
-    return 0, rec["id"]
+# Track các media_group_id đã trả lời để album chỉ reply 1 lần
+# (in-memory; nếu muốn bền vững hơn thì lưu thêm vào Airtable Meta)
+PROCESSED_MEDIA_GROUP_IDS = set()
 
-def set_last_update_id(value, rec_id=None):
-    if rec_id:
-        tbl_meta.update(rec_id, {"value": str(value)})
-    else:
-        recs = tbl_meta.all(formula=match({"key": "last_update_id"}), page_size=1)
-        if recs:
-            tbl_meta.update(recs[0]["id"], {"value": str(value)})
-        else:
-            tbl_meta.create({"key": "last_update_id", "value": str(value)})
+# Format hợp lệ: 8 số + " - " + chữ (cho phép chữ/số/khoảng trắng, có dấu)
+FORMAT_RE = re.compile(r"^\s*\d{8}\s*-\s*[^\s].+$", re.UNICODE)
 
-def delete_webhook():
-    try:
-        requests.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
-            params={"drop_pending_updates": False}, timeout=15
-        )
-    except Exception:
-        pass
+# Timezone VN
+VN_TZ = timezone(timedelta(hours=7))
 
-def fetch_updates(offset=None):
-    params = {}
-    if offset is not None:
-        params["offset"] = offset
-    # gửi allowed_updates đúng chuẩn JSON
-    params["allowed_updates"] = json.dumps(["message"])
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram getUpdates error: {data}")
-    return data["result"]
 
-def send_message(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    r = requests.get(url, params={"chat_id": GROUP_ID, "text": text}, timeout=30)
-    r.raise_for_status()
-
-def reply_to(msg, text):
-    """Reply ngay dưới tin nhắn gốc."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    params = {
-        "chat_id": msg["chat"]["id"],
-        "text": text,
-        "reply_to_message_id": msg["message_id"],
-        "allow_sending_without_reply": True,
-    }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-
-def iso_local(ts):
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(VN_TZ)
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-def get_message_text(msg):
-    # ưu tiên text, sau đó caption; nếu không có -> chuỗi rỗng
-    return msg.get("text") or msg.get("caption") or ""
-
-def is_service_message(msg: dict) -> bool:
-    service_keys = [
-        "new_chat_members","left_chat_member","new_chat_title","new_chat_photo",
-        "delete_chat_photo","group_chat_created","supergroup_chat_created",
-        "migrate_to_chat_id","migrate_from_chat_id","pinned_message"
-    ]
-    return any(k in msg for k in service_keys)
-
-# ---- VALIDATION: 8 số + " - " + chữ (cho phép kèm số & khoảng trắng ở phần chữ) ----
-def is_valid_report(text: str) -> bool:
-    """
-    Hợp lệ khi:
-      - Bắt đầu đúng 8 chữ số
-      - theo sau là ' - ' (dấu cách, gạch ngang, dấu cách)
-      - phần sau chứa chữ cái (có thể có số và khoảng trắng). Yêu cầu có ÍT NHẤT 1 chữ cái.
-    Ví dụ hợp lệ:
-      23082025 - Kho Mien Dong
-      23082025 - Mien Dong 01
-    """
+# -------------------- Utils --------------------
+def is_valid_format(text: str) -> bool:
     if not text:
         return False
-    m = re.match(r'^\s*(\d{8})\s-\s(.+?)\s*$', text)
-    if not m:
-        return False
-    tail = m.group(2)
-    # Cho phép chữ, số, khoảng trắng; phải có ít nhất một chữ (isalpha) để tránh toàn số.
-    return any(ch.isalpha() for ch in tail) and all(ch.isalpha() or ch.isdigit() or ch.isspace() for ch in tail)
+    return bool(FORMAT_RE.match(text))
 
-# ---------- Main ----------
-def collect_once():
-    delete_webhook()
-    last_id, rec_id = get_last_update_id()
-    updates = fetch_updates(offset=last_id + 1 if last_id else None)
-    if not updates:
-        print("No new updates.")
-        return 0
 
-    max_update_id = last_id
-    created = 0
+def now_vn_iso() -> str:
+    return datetime.now(VN_TZ).isoformat(timespec="seconds")
 
-    # Tách tin nhắn thường và album (media_group_id)
-    normal_msgs = []
-    media_groups = {}  # mgid -> list[message]
 
-    for upd in updates:
-        max_update_id = max(max_update_id, upd["update_id"])
-        msg = upd.get("message")
-        if not msg:
-            continue
-        if str(msg["chat"]["id"]) != str(GROUP_ID):
-            continue
-        frm = msg.get("from", {}) or {}
-        if frm.get("is_bot") or is_service_message(msg):
-            continue
+def safe_get_fields(rec) -> dict:
+    """
+    Airtable record chuẩn là dict {'id': 'rec...', 'fields': {...}}
+    Nhưng phòng trường hợp code ở nơi khác trả về list, ta xử lý an toàn.
+    """
+    if isinstance(rec, dict):
+        return rec.get("fields", {}) or {}
+    if isinstance(rec, list):
+        # Lấy record đầu nếu là list record
+        for r in rec:
+            if isinstance(r, dict):
+                return r.get("fields", {}) or {}
+    raise TypeError(f"Unexpected record type: {type(rec)}")
 
-        mgid = msg.get("media_group_id")
-        if mgid:
-            media_groups.setdefault(mgid, []).append(msg)
-        else:
-            normal_msgs.append(msg)
 
-    # Xử lý tin nhắn thường (text / 1 ảnh)
-    for msg in normal_msgs:
-        frm = msg.get("from", {}) or {}
-        user_id = str(frm.get("id", ""))
-        username = frm.get("username") or f"{frm.get('first_name','')} {frm.get('last_name','')}".strip() or ""
-        text = get_message_text(msg)
-        ts_local = iso_local(msg["date"])
+def insert_message_record(chat_id: int, user_id: int, username: str, text: str, ok: bool, msg_id: int, media_group_id: str | None):
+    if not tbl_messages:
+        log.warning("Airtable not configured; skip insert")
+        return
 
-        if is_valid_report(text):
-            tbl_messages.create({
-                "DateTime": ts_local,
-                "UserID": user_id,
-                "Username": username,
-                "Message": text
-            })
-            created += 1
-            ack = "Đã ghi nhận báo cáo 5s ngày hôm nay"
-        else:
-            ack = "Kiểm tra lại format và gửi báo cáo lại"
+    fields = {
+        "chat_id": str(chat_id),
+        "user_id": str(user_id),
+        "username": username or "",
+        "text": text or "",
+        "is_valid": bool(ok),
+        "message_id": str(msg_id),
+        "media_group_id": str(media_group_id) if media_group_id else "",
+        "created_at": now_vn_iso(),
+    }
+    try:
+        tbl_messages.create(fields)
+    except Exception as e:
+        log.error("Insert to Airtable failed: %s", e)
 
+
+async def reply_once_for_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_text: str):
+    """
+    Đảm bảo album nhiều ảnh cùng 1 caption chỉ trả lời 1 lần.
+    - Nếu message có media_group_id, dùng nó để dedupe.
+    - Nếu không có, trả lời bình thường.
+    """
+    msg = update.effective_message
+    mgid = msg.media_group_id
+
+    if mgid:
+        if mgid in PROCESSED_MEDIA_GROUP_IDS:
+            # Đã trả lời album này
+            return
+        PROCESSED_MEDIA_GROUP_IDS.add(mgid)
+        await msg.reply_text(reply_text)
+    else:
+        await msg.reply_text(reply_text)
+
+
+# -------------------- Handlers --------------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bot sẵn sàng. Gửi báo cáo theo dạng `12345678 - Nội dung` nhé!")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Nhận text hoặc ảnh/caption:
+    - Nếu đúng format: trả lời xác nhận + ghi Airtable
+    - Nếu sai: nhắc lại format + KHÔNG ghi Airtable
+    - Album nhiều ảnh 1 caption: chỉ trả lời 1 lần
+    """
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    text = ""
+    media_group_id = msg.media_group_id
+
+    if msg.caption:  # ảnh/video với caption
+        text = msg.caption
+    elif msg.text:
+        text = msg.text
+    else:
+        # Không phải text/caption thì bỏ qua (stickers, etc.)
+        return
+
+    ok = is_valid_format(text)
+
+    # Insert vào Airtable chỉ khi đúng format
+    if ok:
+        insert_message_record(
+            chat_id=chat.id,
+            user_id=user.id if user else 0,
+            username=(user.username if user and user.username else ""),
+            text=text,
+            ok=True,
+            msg_id=msg.id,
+            media_group_id=media_group_id,
+        )
+        await reply_once_for_media_group(update, context, "Đã ghi nhận báo cáo 5s ngày hôm nay")
+    else:
+        # KHÔNG insert nếu sai format
+        await reply_once_for_media_group(update, context, "Kiểm tra lại format và gửi báo cáo lại")
+
+
+# -------------------- Daily Report --------------------
+def fetch_today_records() -> list[dict]:
+    """
+    Lấy record trong ngày (theo giờ VN) từ bảng Messages.
+    Giả sử có cột 'created_at' ISO8601.
+    """
+    if not tbl_messages:
+        log.warning("Airtable not configured; cannot fetch today records")
+        return []
+
+    today_start = datetime.now(VN_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
+
+    # Airtable không query theo TZ, nên ta lọc client-side sau khi lấy rộng
+    # Có thể thêm điều kiện match theo ngày (nếu bạn có cột ngày dạng string YYYY-MM-DD)
+    try:
+        # Lấy tối đa 1000 record gần đây, sau đó lọc theo created_at
+        records = tbl_messages.all(page_size=100, max_records=1000)
+    except Exception as e:
+        log.error("Airtable fetch failed: %s", e)
+        return []
+
+    results = []
+    for rec in records:
         try:
-            reply_to(msg, ack)
+            fields = safe_get_fields(rec)
+            created = fields.get("created_at")
+            if not created:
+                continue
+            # parse created_at
+            try:
+                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            except Exception:
+                # nếu không chuẩn ISO, bỏ qua
+                continue
+            # chuyển về VN
+            dt_vn = dt.astimezone(VN_TZ)
+            if today_start <= dt_vn < today_end:
+                results.append(rec)
         except Exception as e:
-            print("Ack failed:", e)
+            log.warning("Skip bad record shape: %s", e)
+    return results
 
-    # Xử lý album nhiều ảnh: chỉ reply/lưu 1 lần theo caption của album
-    for mgid, msgs in media_groups.items():
-        # Chọn message đại diện: ưu tiên cái có caption; nếu không có thì lấy cái đầu
-        rep = None
-        caption = ""
-        for m in msgs:
-            cap = m.get("caption") or ""
-            if cap:
-                rep = m
-                caption = cap
-                break
-        if rep is None:
-            rep = msgs[0]  # reply vào ảnh đầu tiên nếu không có caption
-            caption = ""   # không caption => coi là sai format
 
-        frm = rep.get("from", {}) or {}
-        user_id = str(frm.get("id", ""))
-        username = frm.get("username") or f"{frm.get('first_name','')} {frm.get('last_name','')}".strip() or ""
-        ts_local = iso_local(rep["date"])
+def build_summary(records: list[dict]) -> str:
+    """
+    Tạo báo cáo tổng hợp:
+    - Tổng số báo cáo hợp lệ hôm nay
+    - Đếm theo chat_id
+    """
+    total = 0
+    by_chat = defaultdict(int)
 
-        if is_valid_report(caption):
-            tbl_messages.create({
-                "DateTime": ts_local,
-                "UserID": user_id,
-                "Username": username,
-                "Message": caption
-            })
-            created += 1
-            ack = "Đã ghi nhận báo cáo 5s ngày hôm nay"
-        else:
-            ack = "Kiểm tra lại format và gửi báo cáo lại"
+    for rec in records:
+        fields = safe_get_fields(rec)
+        if not fields.get("is_valid"):
+            continue
+        total += 1
+        cid = fields.get("chat_id", "unknown")
+        by_chat[cid] += 1
 
-        try:
-            reply_to(rep, ack)
-        except Exception as e:
-            print("Ack failed:", e)
+    lines = [f"BÁO CÁO 5S - {datetime.now(VN_TZ).strftime('%d/%m/%Y')}"]
+    lines.append(f"Tổng báo cáo hợp lệ: {total}")
+    if by_chat:
+        lines.append("Theo room:")
+        for cid, cnt in sorted(by_chat.items(), key=lambda x: x[0]):
+            lines.append(f" - Chat {cid}: {cnt}")
+    return "\n".join(lines)
 
-    if max_update_id > last_id:
-        set_last_update_id(max_update_id, rec_id)
 
-    print(f"Collected {created} messages.")
-    return created
+async def send_daily_report_async(token: str, chat_id: str, text: str):
+    app = ApplicationBuilder().token(token).build()
+    async with app:
+        await app.bot.send_message(chat_id=chat_id, text=text)
+
 
 def send_daily_report():
-    # Đếm UserID duy nhất của NGÀY HÔM NAY (giờ VN) trong các bản ghi HỢP LỆ
-    today_prefix = datetime.now(VN_TZ).strftime("%Y-%m-%d")
-    formula = f"SEARCH('{today_prefix}', {{DateTime}})"
-    users = set()
-    for rec in tbl_messages.iterate(formula=formula, page_size=100):
-        fields = rec.get("fields", {})
-        uid = fields.get("UserID")
-        if uid:
-            users.add(uid)
-    count = len(users)
-    send_message(f"Hôm nay có {count} tài khoản đã gửi tin nhắn trong nhóm.")
-    print(f"Report sent. Unique users today: {count}")
+    """
+    Hàm chạy trong GitHub Actions:
+    - Lấy record hôm nay
+    - Tổng hợp
+    - Gửi Telegram
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Missing secrets: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID", file=sys.stderr)
+        sys.exit(1)
+
+    recs = fetch_today_records()
+    report_text = build_summary(recs)
+    # In ra log để xem trên Actions
+    print(report_text)
+
+    # Gửi Telegram (synchronous wrapper)
+    import asyncio
+    asyncio.run(send_daily_report_async(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, report_text))
+
+
+# -------------------- Entrypoint --------------------
+def run_bot_polling():
+    if not TELEGRAM_BOT_TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN is required to run bot")
+        sys.exit(1)
+
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    # Nhận mọi message text/photo/caption
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO, handle_message))
+
+    log.info("Bot is running (polling)...")
+    app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
-    mode = os.getenv("MODE", "collect")  # "collect" hoặc "report"
-    if mode == "collect":
-        collect_once()
-    elif mode == "report":
+    """
+    Cách chạy:
+    - Chạy bot:      python bot.py
+    - Chạy báo cáo:  python bot.py --daily
+      (hoặc đặt ENV RUN_DAILY=1 để auto chạy báo cáo)
+    """
+    if "--daily" in sys.argv or os.getenv("RUN_DAILY") == "1":
         send_daily_report()
     else:
-        raise SystemExit("Unknown MODE. Use collect or report.")
+        run_bot_polling()
