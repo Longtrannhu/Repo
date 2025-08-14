@@ -1,4 +1,4 @@
-# bot.py (V2) — daily mode không cần python-telegram-bot
+# bot.py (V3) — Mặc định chạy daily khi ở GitHub Actions
 import os
 import re
 import sys
@@ -9,7 +9,7 @@ from collections import defaultdict
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-from pyairtable import Api  # cần pyairtable
+from pyairtable import Api  # chỉ cần pyairtable cho chế độ daily
 
 # -------------------- Config --------------------
 logging.basicConfig(
@@ -28,11 +28,13 @@ TBL_META = os.getenv("TBL_META", "Meta")
 
 api = Api(AIRTABLE_TOKEN) if AIRTABLE_TOKEN else None
 tbl_messages = api.table(AIRTABLE_BASE_ID, TBL_MESSAGES) if api else None
-tbl_meta = api.table(AIRTABLE_BASE_ID, TBL_META) if api else None
+tbl_meta = api.table(AIRTABLE_BASE_ID, TBL_META) if api else None  # nếu cần
 
 VN_TZ = timezone(timedelta(hours=7))
 FORMAT_RE = re.compile(r"^\s*\d{8}\s*-\s*[^\s].+$", re.UNICODE)
-PROCESSED_MEDIA_GROUP_IDS = set()  # dùng khi chạy bot realtime
+
+# Dùng khi chạy bot realtime để tránh reply nhiều lần cho 1 album
+PROCESSED_MEDIA_GROUP_IDS = set()
 
 # -------------------- Utils --------------------
 def is_valid_format(text: str) -> bool:
@@ -42,6 +44,10 @@ def now_vn_iso() -> str:
     return datetime.now(VN_TZ).isoformat(timespec="seconds")
 
 def safe_get_fields(rec) -> dict:
+    """
+    Record Airtable chuẩn: {'id': 'rec...', 'fields': {...}}
+    Nếu lỡ là list[record], lấy phần tử đầu.
+    """
     if isinstance(rec, dict):
         return rec.get("fields", {}) or {}
     if isinstance(rec, list):
@@ -89,13 +95,17 @@ def fetch_today_records() -> list[dict]:
     if not tbl_messages:
         log.warning("Airtable not configured; cannot fetch today records")
         return []
+
     today_start = datetime.now(VN_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     today_end = today_start + timedelta(days=1)
+
     try:
+        # Lấy rộng rồi lọc client-side theo created_at (ISO string)
         records = tbl_messages.all(page_size=100, max_records=1000)
     except Exception as e:
         log.error("Airtable fetch failed: %s", e)
         return []
+
     results = []
     for rec in records:
         try:
@@ -123,6 +133,7 @@ def build_summary(records: list[dict]) -> str:
             continue
         total += 1
         by_chat[f.get("chat_id", "unknown")] += 1
+
     lines = [f"BÁO CÁO 5S - {datetime.now(VN_TZ).strftime('%d/%m/%Y')}"]
     lines.append(f"Tổng báo cáo hợp lệ: {total}")
     if by_chat:
@@ -137,7 +148,7 @@ def send_daily_report():
         sys.exit(1)
     recs = fetch_today_records()
     report_text = build_summary(recs)
-    print(report_text)  # để xem trong log Actions
+    print(report_text)  # hiển thị trong log Actions
     send_tg_message_http(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, report_text)
 
 # -------------------- Bot realtime (lazy import PTB) --------------------
@@ -146,7 +157,7 @@ def run_bot_polling():
         log.error("TELEGRAM_BOT_TOKEN is required to run bot")
         sys.exit(1)
 
-    # Import tại đây để daily mode không cần lib này
+    # Import bên trong để chế độ daily không yêu cầu lib này
     from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
     async def start_cmd(update, context):
@@ -195,7 +206,19 @@ def run_bot_polling():
 
 # -------------------- Entrypoint --------------------
 if __name__ == "__main__":
-    if "--daily" in sys.argv or os.getenv("RUN_DAILY") == "1":
+    # CÁCH 2: Mặc định chạy daily khi ở GitHub Actions
+    in_actions = os.getenv("GITHUB_ACTIONS") == "true"
+    force_daily = ("--daily" in sys.argv) or (os.getenv("RUN_DAILY") == "1")
+    force_bot = ("--bot" in sys.argv)
+
+    # Ưu tiên:
+    #   1) --bot  => chạy bot realtime
+    #   2) --daily hoặc RUN_DAILY=1 => daily
+    #   3) Nếu ở GitHub Actions => daily
+    #   4) Mặc định local => bot realtime
+    if force_bot:
+        run_bot_polling()
+    elif force_daily or in_actions:
         send_daily_report()
     else:
         run_bot_polling()
