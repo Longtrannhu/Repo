@@ -2,7 +2,7 @@
 # - Gộp album theo media_group_id
 # - Chống trùng ảnh (Images table) + fallback chống trùng caption trong ngày
 # - Chỉ cảnh báo 1 lần/caption trong mỗi lần quét (tránh spam)
-# - Báo cáo 21h gọn đẹp (Markdown)
+# - Báo cáo 21h dùng HTML (escape + tự cắt khi dài)
 
 import os, re, datetime, hashlib
 from typing import List, Dict, Any, Set
@@ -75,19 +75,35 @@ def _send_reply(chat_id: str, reply_to_message_id: int, text: str):
                allow_sending_without_reply=True)
 
 def _send_markdown(chat_id: str, text: str):
+    # Giữ lại nếu cần dùng nơi khác; báo cáo 21h dùng HTML bên dưới
     return _tg("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown")
 
-def _md_sanitize(s: str) -> str:
-    """Làm sạch chuỗi để không phá vỡ Markdown (Telegram Markdown v1)."""
-    if not s:
+# ---- NEW: HTML helpers (an toàn, tránh 400 Bad Request) ----
+def _html_escape(s: str) -> str:
+    if s is None:
         return ""
-    return (
-        s.replace("\\", "\\\\")
-         .replace("`", "'")
-         .replace("*", "\\*")
-         .replace("_", "\\_")
-         .replace("[", "\\[")
-    )
+    return (str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+def _send_html(chat_id: str, html: str):
+    return _tg("sendMessage", chat_id=chat_id, text=html, parse_mode="HTML")
+
+def _send_long_html(chat_id: str, html: str, limit: int = 3900):
+    """
+    Telegram giới hạn ~4096 ký tự. Hàm này tự cắt theo dòng để gửi nhiều phần.
+    Dùng 3900 để chừa biên an toàn cho emoji/tag HTML.
+    """
+    text = html
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = limit
+        _send_html(chat_id, text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text:
+        _send_html(chat_id, text)
 
 # ===== Meta KV with fallback =====
 def _kv_find(tbl, key_field: str, val_field: str, key: str):
@@ -358,35 +374,41 @@ def run_daily_report():
     miss  = max(total - sent, 0)
     pct   = int(round((sent/total)*100)) if total else 0
 
-    # 2) Danh sách "đã gửi"
+    # 2) Danh sách "đã gửi" (HTML an toàn)
     sent_lines = []
     for it in sorted(latest, key=lambda x: x["code"]):
-        code = it["code"]
-        name = name_map.get(code, "")
+        code = _html_escape(it["code"])
+        name = _html_escape(name_map.get(it["code"], ""))
         txt  = (it["text"] or "").replace("\n", " ")
         if len(txt) > 90:
             txt = txt[:87] + "..."
-        line = f"• ✅ `{code}` — `{_md_sanitize(name)}` — “{_md_sanitize(txt)}”"
-        sent_lines.append(line)
+        txt = _html_escape(txt)
+        sent_lines.append(f"• ✅ <code>{code}</code> — {name} — “{txt}”")
     if not sent_lines:
-        sent_lines = ["_Chưa có nơi nào gửi trong hôm nay_"]
+        sent_lines = ["<i>Chưa có nơi nào gửi trong hôm nay</i>"]
 
     # 3) Danh sách "chưa gửi"
     missing = [c for c in master_codes if c not in sent_codes]
-    miss_lines = [f"• ❌ `{c}` — `{_md_sanitize(name_map.get(c, ''))}`".rstrip(" `") for c in missing]
+    miss_lines = []
+    for c in missing:
+        code = _html_escape(c)
+        name = _html_escape(name_map.get(c, ""))
+        miss_lines.append(f"• ❌ <code>{code}</code> — {name}")
     if not miss_lines:
-        miss_lines = ["_Tất cả nơi đã gửi đầy đủ_"]
+        miss_lines = ["<i>Tất cả nơi đã gửi đầy đủ</i>"]
 
-    # 4) Ghép message Markdown
+    # 4) Ghép message HTML
     header = (
-        f"📊 *Báo cáo 21h* — {today_str}\n"
-        f"*Tổng quan:* Tổng `{total}` • ✅ Đã gửi `{sent}` • ❌ Thiếu `{miss}` • 📈 {pct}% đã gửi\n\n"
+        f"📊 <b>Báo cáo 21h</b> — {today_str}\n"
+        f"<b>Tổng quan:</b> Tổng <code>{total}</code> • ✅ Đã gửi <code>{sent}</code> • "
+        f"❌ Thiếu <code>{miss}</code> • 📈 {pct}% đã gửi\n\n"
     )
-    body1 = f"*1) Text/Caption đã gửi ({sent}):*\n" + "\n".join(sent_lines) + "\n\n"
-    body2 = f"*2) Những nơi chưa gửi ({miss}):*\n" + "\n".join(miss_lines)
-    msg = header + body1 + body2
+    body1 = f"<b>1) Text/Caption đã gửi ({sent}):</b>\n" + "\n".join(sent_lines) + "\n\n"
+    body2 = f"<b>2) Những nơi chưa gửi ({miss}):</b>\n" + "\n".join(miss_lines)
+    html_msg = header + body1 + body2
 
-    _send_markdown(TELEGRAM_CHAT_ID, msg)
+    # 5) Gửi (tự động cắt nếu quá dài)
+    _send_long_html(TELEGRAM_CHAT_ID, html_msg)
 
 # ===== Main =====
 if __name__ == "__main__":
