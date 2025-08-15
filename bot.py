@@ -1,30 +1,11 @@
 # bot.py — Telegram collector + 21h report (Airtable, pyairtable 3.x)
-# ---------------------------------------------------------------
-# Chức năng:
-# 1) --collect : quét tin nhắn trong group, kiểm tra format, cảnh báo trùng ảnh,
-#                trả lời theo yêu cầu và ghi Airtable.
-# 2) --daily   : gửi báo cáo 21h (2 cột: Caption đã gửi | Nơi chưa gửi).
-#
-# Yêu cầu Airtable:
-# - Table "Meta" có thể chứa cả:
-#   + Danh sách nơi bắt buộc: MaNoi (8 số), TenNoi (tuỳ chọn)
-#   + Cặp Key/Value (để lưu offset getUpdates): Key, Value
-# - Table "Messages": TextOrCaption, Code, Timestamp (tùy bạn đặt, có thể dùng Created Time)
-# - (tuỳ chọn) Table "Images": FileUniqueId, Code, Date (để check trùng ảnh)
-#
-# Env cần có (đã khớp với workflow của bạn):
-# BOT_TOKEN (hoặc TELEGRAM_BOT_TOKEN), GROUP_ID (hoặc TELEGRAM_CHAT_ID),
-# AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_MESSAGES, AIRTABLE_TABLE_META
-# (tuỳ chọn) AIRTABLE_TABLE_IMAGES
-# ---------------------------------------------------------------
-
 import os, re, datetime
 from typing import List, Dict, Any
 import pytz
 import requests
 from pyairtable import Api  # v3.x
 
-# ================== ENV & CONST ==================
+# ===== ENV =====
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID    = str(os.getenv("TELEGRAM_CHAT_ID") or os.getenv("GROUP_ID") or "").strip()
 
@@ -32,24 +13,21 @@ AIRTABLE_TOKEN      = os.getenv("AIRTABLE_TOKEN")
 AIRTABLE_BASE_ID    = os.getenv("AIRTABLE_BASE_ID")
 TBL_MESSAGES        = os.getenv("TBL_MESSAGES", "Messages")
 TBL_META            = os.getenv("TBL_META", "Meta")
-TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional: bảng lưu dấu vết ảnh
+TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional
 
-# Tên cột trong Airtable (có thể override qua ENV để khớp schema)
+# Tên cột (cho phép override qua ENV)
 COL_MSG_TEXT        = os.getenv("COL_MSG_TEXT", "TextOrCaption")
 COL_MSG_CODE        = os.getenv("COL_MSG_CODE", "Code")
-COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")  # nếu thiếu, sẽ fallback createdTime
+COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")
 COL_MSG_CHAT        = os.getenv("COL_MSG_CHAT", "ChatId")
 COL_MSG_USER        = os.getenv("COL_MSG_USER", "From")
 COL_MSG_TG_MSG_ID   = os.getenv("COL_MSG_TG_MSG_ID", "TelegramMessageId")
 
-# Dòng MaNoi/TenNoi trong Meta (danh sách nơi bắt buộc)
 COL_META_CODE       = os.getenv("COL_META_CODE", "MaNoi")
 COL_META_NAME       = os.getenv("COL_META_NAME", "TenNoi")
-# Dòng Key/Value trong Meta (lưu offset…)
 COL_META_KEY        = os.getenv("COL_META_KEY", "Key")
 COL_META_VAL        = os.getenv("COL_META_VAL", "Value")
 
-# Bảng IMAGES (nếu dùng)
 COL_IMG_HASH        = os.getenv("COL_IMG_HASH", "FileUniqueId")
 COL_IMG_CODE        = os.getenv("COL_IMG_CODE", "Code")
 COL_IMG_DATE        = os.getenv("COL_IMG_DATE", "Date")
@@ -57,18 +35,16 @@ COL_IMG_DATE        = os.getenv("COL_IMG_DATE", "Date")
 VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 CODE_RE = re.compile(r"^(\d{8})\s*-\s*", re.UNICODE)
 
-# Reply messages
 MSG_OK      = "🆗Đã ghi nhận báo cáo 5s ngày hôm nay"
 MSG_BADFMT  = "🆕Kiểm tra lại format và gửi báo cáo lại"
 MSG_DUPIMG  = "⛔️Ảnh gửi có dấu hiệu trùng với trước đây, nhờ kiểm tra lại"
 
-# ================== Airtable API (v3) ==================
+# ===== Airtable client (v3) =====
 _api = Api(AIRTABLE_TOKEN)
-
 def _air_table(name: str):
     return _api.table(AIRTABLE_BASE_ID, name)
 
-# ================== Helpers ==================
+# ===== Helpers =====
 def _today_vn():
     return datetime.datetime.now(VN_TZ).date()
 
@@ -87,43 +63,32 @@ def _tg(method: str, **kwargs):
     return r.json()
 
 def _send_reply(chat_id: str, reply_to_message_id: int, text: str):
-    return _tg("sendMessage",
-               chat_id=chat_id,
-               text=text,
+    return _tg("sendMessage", chat_id=chat_id, text=text,
                reply_to_message_id=reply_to_message_id,
                allow_sending_without_reply=True)
 
 def _send_markdown(chat_id: str, text: str):
-    return _tg("sendMessage",
-               chat_id=chat_id,
-               text=text,
-               parse_mode="Markdown")
+    return _tg("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown")
 
-# ================== Meta KV (lưu offset getUpdates) ==================
+# ===== Meta KV (lưu offset getUpdates) =====
 def _meta_get(key: str) -> str:
-    """
-    Đọc giá trị theo khóa 'key' trong bảng Meta (cột Key/Value).
-    """
     tbl = _air_table(TBL_META)
     recs = tbl.all(
-        filter_by_formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'"
+        formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'"  # <- dùng 'formula' (v3)
     )
     return recs[0]["fields"].get(COL_META_VAL, "") if recs else ""
 
 def _meta_set(key: str, val: str):
-    """
-    Ghi/ cập nhật giá trị cho khóa 'key' trong bảng Meta (cột Key/Value).
-    """
     tbl = _air_table(TBL_META)
     recs = tbl.all(
-        filter_by_formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'"
+        formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'"
     )
     if recs:
         tbl.update(recs[0]["id"], {COL_META_VAL: val})
     else:
         tbl.create({COL_META_KEY: key, COL_META_VAL: val})
 
-# ================== COLLECTOR (15') ==================
+# ===== Collector (15') =====
 def _extract_code(text: str) -> str:
     if not text:
         return ""
@@ -132,7 +97,7 @@ def _extract_code(text: str) -> str:
 
 def _photo_unique_ids(photo_sizes: List[Dict[str,Any]]) -> List[str]:
     ids = []
-    for ph in photo_sizes or []:
+    for ph in (photo_sizes or []):
         u = ph.get("file_unique_id")
         if u and u not in ids:
             ids.append(u)
@@ -143,7 +108,7 @@ def _is_duplicate_photo(ids: List[str]) -> bool:
         return False
     tbl = _air_table(TBL_IMAGES)
     for uid in ids:
-        recs = tbl.all(filter_by_formula=f"{{{COL_IMG_HASH}}} = '{uid}'")
+        recs = tbl.all(formula=f"{{{COL_IMG_HASH}}} = '{uid}'")  # <- formula
         if recs:
             return True
     return False
@@ -160,13 +125,6 @@ def _save_message(record: Dict[str,Any]):
     _air_table(TBL_MESSAGES).create(record)
 
 def collect_once():
-    """
-    - Lấy update từ Telegram (getUpdates) theo offset lưu ở Meta.
-    - Chỉ xử lý message thuộc group TELEGRAM_CHAT_ID.
-    - 1 caption nhiều ảnh -> chỉ reply 1 lần.
-    - Sai format -> reply MSG_BADFMT và KHÔNG ghi `Messages`.
-    - Đúng format -> ghi `Messages`; nếu ảnh trùng -> reply thêm MSG_DUPIMG; cuối cùng reply MSG_OK.
-    """
     offset = _meta_get("last_update_id")
     offset = int(offset) + 1 if offset else None
 
@@ -216,10 +174,9 @@ def collect_once():
     if last_id is not None:
         _meta_set("last_update_id", str(last_id))
 
-# ================== DAILY REPORT (21h) ==================
+# ===== Daily report (21h) =====
 def _get_master_codes():
     tbl = _air_table(TBL_META)
-    # Lấy các dòng có MaNoi (bỏ qua dòng chỉ có Key/Value)
     recs = tbl.all(fields=[COL_META_CODE, COL_META_NAME])
     codes, name_map = [], {}
     for r in recs:
@@ -288,7 +245,6 @@ def run_daily_report():
     latest = _pick_latest_per_code(items_today)
     sent_codes = {it["code"] for it in latest}
 
-    # Cột 1: caption mới nhất theo từng nơi
     col1_vals = []
     for it in latest:
         txt = (it["text"] or "").replace("\n", " ")
@@ -296,7 +252,6 @@ def run_daily_report():
             txt = txt[:117] + "..."
         col1_vals.append(txt)
 
-    # Cột 2: nơi chưa gửi (MaNoi - TenNoi nếu có)
     missing = [c for c in master_codes if c not in sent_codes]
     col2_vals = [f"{c} - {name_map.get(c,'')}".strip().rstrip(" -") for c in missing]
 
@@ -304,7 +259,7 @@ def run_daily_report():
     msg = f"📊 *Báo cáo 21h* (ngày {today_str})\n```\n{table}\n```"
     _send_markdown(TELEGRAM_CHAT_ID, msg)
 
-# ================== MAIN ==================
+# ===== Main =====
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -315,5 +270,4 @@ if __name__ == "__main__":
     if args.daily:
         run_daily_report()
     else:
-        # Mặc định chạy collector (hoặc gọi rõ --collect trong workflow)
         collect_once()
