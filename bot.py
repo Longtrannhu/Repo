@@ -1,6 +1,7 @@
 # bot.py — Telegram collector + 21h report (Airtable, pyairtable 3.x)
 # - Gộp album theo media_group_id
 # - Chống trùng ảnh (Images table) + fallback chống trùng caption trong ngày
+# - Chỉ cảnh báo 1 lần/caption trong mỗi lần quét (tránh spam)
 # - Báo cáo 21h gọn đẹp (Markdown)
 
 import os, re, datetime, hashlib
@@ -190,7 +191,7 @@ def _load_today_caption_hashes() -> Set[str]:
             s.add(h)
     return s
 
-# ===== Collector (15') — GỘP THEO media_group_id & DEDUP =====
+# ===== Collector (15') — GỘP THEO media_group_id & DEDUP & CHỈ CẢNH BÁO 1 LẦN =====
 def _extract_code(text: str) -> str:
     if not text:
         return ""
@@ -204,6 +205,7 @@ def collect_once():
     # tải bộ nhớ trùng để dùng trong phiên poll này
     seen_uids = _load_seen_uids()
     seen_caps = _load_today_caption_hashes()
+    warned_caps: Set[str] = set()   # caption đã cảnh báo trong LẦN QUÉT NÀY
 
     resp = _tg("getUpdates", timeout=10, allowed_updates=["message"], offset=offset)
     updates = resp.get("result", [])
@@ -227,6 +229,7 @@ def collect_once():
 
         content = caption if caption else text
 
+        # Gom album: chỉ xử lý 1 lần/album
         if media_group_id:
             g = group_buf.get(media_group_id)
             if not g:
@@ -241,17 +244,24 @@ def collect_once():
         # ---- Message lẻ ----
         code = _extract_code(content)
         if not code:
-            _send_reply(chat_id, message_id, MSG_BADFMT)
+            if content:
+                ch = _hash_caption(content)
+                if ch not in warned_caps:
+                    _send_reply(chat_id, message_id, MSG_BADFMT)
+                    warned_caps.add(ch)
             continue
 
         photo_ids = _photo_unique_ids(photos)
         cap_hash = _hash_caption(content)
 
+        # Nếu trùng ảnh hoặc caption trong ngày -> CHỈ cảnh báo 1 lần cho cap này
         if _is_duplicate_photo(photo_ids, seen_uids) or cap_hash in seen_caps:
-            _send_reply(chat_id, message_id, MSG_DUPIMG)
+            if cap_hash not in warned_caps:
+                _send_reply(chat_id, message_id, MSG_DUPIMG)
+                warned_caps.add(cap_hash)
             continue
 
-        # lưu
+        # Lưu & xác nhận
         _air_table(TBL_MESSAGES).create({COL_MSG_TEXT: content, COL_MSG_CODE: code})
         _save_photo_ids(code, photo_ids, seen_uids)
         seen_caps.add(cap_hash)
@@ -266,12 +276,18 @@ def collect_once():
 
         code = _extract_code(content)
         if not code:
-            _send_reply(chat_id, rep_id, MSG_BADFMT)
+            if content:
+                ch = _hash_caption(content)
+                if ch not in warned_caps:
+                    _send_reply(chat_id, rep_id, MSG_BADFMT)
+                    warned_caps.add(ch)
             continue
 
         cap_hash = _hash_caption(content)
         if _is_duplicate_photo(photo_ids, seen_uids) or cap_hash in seen_caps:
-            _send_reply(chat_id, rep_id, MSG_DUPIMG)
+            if cap_hash not in warned_caps:
+                _send_reply(chat_id, rep_id, MSG_DUPIMG)
+                warned_caps.add(cap_hash)
             continue
 
         _air_table(TBL_MESSAGES).create({COL_MSG_TEXT: content, COL_MSG_CODE: code})
@@ -342,17 +358,16 @@ def run_daily_report():
     miss  = max(total - sent, 0)
     pct   = int(round((sent/total)*100)) if total else 0
 
-    # 2) Danh sách "đã gửi" (đẹp + ngắn gọn)
+    # 2) Danh sách "đã gửi"
     sent_lines = []
     for it in sorted(latest, key=lambda x: x["code"]):
         code = it["code"]
         name = name_map.get(code, "")
         txt  = (it["text"] or "").replace("\n", " ")
-        if len(txt) > 90:  # cắt gọn để nhìn gọn gàng
+        if len(txt) > 90:
             txt = txt[:87] + "..."
         line = f"• ✅ `{code}` — `{_md_sanitize(name)}` — “{_md_sanitize(txt)}”"
         sent_lines.append(line)
-
     if not sent_lines:
         sent_lines = ["_Chưa có nơi nào gửi trong hôm nay_"]
 
@@ -362,17 +377,15 @@ def run_daily_report():
     if not miss_lines:
         miss_lines = ["_Tất cả nơi đã gửi đầy đủ_"]
 
-    # 4) Ghép message Markdown gọn đẹp
+    # 4) Ghép message Markdown
     header = (
         f"📊 *Báo cáo 21h* — {today_str}\n"
         f"*Tổng quan:* Tổng `{total}` • ✅ Đã gửi `{sent}` • ❌ Thiếu `{miss}` • 📈 {pct}% đã gửi\n\n"
     )
     body1 = f"*1) Text/Caption đã gửi ({sent}):*\n" + "\n".join(sent_lines) + "\n\n"
     body2 = f"*2) Những nơi chưa gửi ({miss}):*\n" + "\n".join(miss_lines)
-
     msg = header + body1 + body2
 
-    # 5) Gửi
     _send_markdown(TELEGRAM_CHAT_ID, msg)
 
 # ===== Main =====
