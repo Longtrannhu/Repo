@@ -1,4 +1,6 @@
 # bot.py — Telegram collector + 21h report (Airtable, pyairtable 3.x)
+# Ghi tối thiểu 2 cột vào Messages: TextOrCaption, Code (không cần Timestamp)
+
 import os, re, datetime
 from typing import List, Dict, Any
 import pytz
@@ -19,10 +21,8 @@ TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional
 # Tên cột (có thể override qua ENV)
 COL_MSG_TEXT        = os.getenv("COL_MSG_TEXT", "TextOrCaption")
 COL_MSG_CODE        = os.getenv("COL_MSG_CODE", "Code")
-COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")
-COL_MSG_CHAT        = os.getenv("COL_MSG_CHAT", "ChatId")
-COL_MSG_USER        = os.getenv("COL_MSG_USER", "From")
-COL_MSG_TG_MSG_ID   = os.getenv("COL_MSG_TG_MSG_ID", "TelegramMessageId")
+COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")  # chỉ dùng khi ĐỌC; khi CREATE sẽ bỏ qua
+# (các cột phụ như ChatId/From/TelegramMessageId đã bỏ để tránh lỗi UNKNOWN_FIELD_NAME)
 
 # Danh sách nơi bắt buộc (Meta)
 COL_META_CODE       = os.getenv("COL_META_CODE", "MaNoi")
@@ -75,7 +75,7 @@ def _send_reply(chat_id: str, reply_to_message_id: int, text: str):
 def _send_markdown(chat_id: str, text: str):
     return _tg("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown")
 
-# ===== Meta KV with graceful fallback =====
+# ===== Meta KV with fallback =====
 def _kv_find(tbl, key_field: str, val_field: str, key: str):
     formula = f"LOWER(TO_TEXT({{{key_field}}}))='{key.lower()}'"
     return tbl.all(formula=formula), val_field
@@ -100,27 +100,26 @@ def _meta_get(key: str) -> str:
 
 def _meta_set(key: str, val: str):
     tbl = _air_table(TBL_META)
-    # 1) Thử update theo cặp Key/Value
+    # 1) Cập nhật theo Key/Value nếu có
     try:
         recs, valf = _kv_find(tbl, COL_META_KEY, COL_META_VAL, key)
         if recs:
             tbl.update(recs[0]["id"], {valf: val}); return
     except HTTPError:
         recs = []
-    # 2) Thử update theo cặp MaNoi/TenNoi
+    # 2) Cập nhật theo MaNoi/TenNoi nếu có
     try:
         recs, valf = _kv_find(tbl, COL_META_CODE, COL_META_NAME, key)
         if recs:
             tbl.update(recs[0]["id"], {valf: val}); return
     except HTTPError:
         recs = []
-    # 3) Tạo mới: ưu tiên Key/Value; nếu không thể, tạo bằng MaNoi/TenNoi
+    # 3) Tạo mới record (ưu tiên Key/Value; nếu fail thì dùng MaNoi/TenNoi)
     for kf, vf in [(COL_META_KEY, COL_META_VAL), (COL_META_CODE, COL_META_NAME)]:
         try:
             tbl.create({kf: key, vf: val}); return
         except HTTPError:
             continue
-    # Nếu vẫn không được thì bỏ qua (không chặn collector)
     return
 
 # ===== Collector (15') =====
@@ -196,13 +195,11 @@ def collect_once():
         if _is_duplicate_photo(photo_ids):
             _send_reply(chat_id, message_id, MSG_DUPIMG)
 
+        # Ghi tối thiểu 2 cột để tránh lỗi UNKNOWN_FIELD_NAME (Timestamp, ChatId, …)
         record = {
             COL_MSG_TEXT: content,
-            COL_MSG_CODE: code,
-            COL_MSG_CHAT: chat_id,
-            COL_MSG_USER: sender,
-            COL_MSG_TG_MSG_ID: message_id,
-            COL_MSG_TS: datetime.datetime.now(VN_TZ).isoformat()
+            COL_MSG_CODE: code
+            # KHÔNG set COL_MSG_TS khi create; sẽ dùng createdTime khi đọc
         }
         _save_message(record)
         _save_photo_ids(code, photo_ids)
@@ -234,7 +231,7 @@ def _get_today_messages():
         f = r.get("fields", {})
         text = str(f.get(COL_MSG_TEXT, "")).strip()
         code = str(f.get(COL_MSG_CODE, "")).strip()
-        ts   = f.get(COL_MSG_TS) or r.get("createdTime")
+        ts   = f.get(COL_MSG_TS) or r.get("createdTime")  # ưu tiên cột Timestamp nếu có, không thì dùng createdTime
         ts_dt = _iso_local(ts) if isinstance(ts, str) else ts
         if not code or not ts_dt:
             if not code and text:
