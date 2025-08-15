@@ -1,411 +1,293 @@
-# bot.py (V6.1) — thêm icon cho các câu trả lời
-import os, re, sys, json, logging
-from datetime import datetime, timedelta, timezone
-from collections import defaultdict
-from typing import List, Dict, Optional, Tuple
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+# bot.py
+import os, re, time, datetime
+from typing import List, Dict, Any
+import pytz
+import requests
+from pyairtable import Table
 
-from pyairtable import Api
-from pyairtable.formulas import match
+# ================== ENV & CONST ==================
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+TELEGRAM_CHAT_ID    = str(os.getenv("TELEGRAM_CHAT_ID") or os.getenv("GROUP_ID") or "").strip()
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("report-bot")
+AIRTABLE_TOKEN      = os.getenv("AIRTABLE_TOKEN")
+AIRTABLE_BASE_ID    = os.getenv("AIRTABLE_BASE_ID")
+TBL_MESSAGES        = os.getenv("TBL_MESSAGES", "Messages")
+TBL_META            = os.getenv("TBL_META", "Meta")
+TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional
 
-# ----- ENV -----
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+# Tên cột trong Airtable (có thể override qua ENV để khớp schema hiện tại)
+COL_MSG_TEXT        = os.getenv("COL_MSG_TEXT", "TextOrCaption")
+COL_MSG_CODE        = os.getenv("COL_MSG_CODE", "Code")
+COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")              # nếu không có, sẽ dùng createdTime
+COL_MSG_CHAT        = os.getenv("COL_MSG_CHAT", "ChatId")
+COL_MSG_USER        = os.getenv("COL_MSG_USER", "From")
+COL_MSG_TG_MSG_ID   = os.getenv("COL_MSG_TG_MSG_ID", "TelegramMessageId")
 
-AIRTABLE_TOKEN   = os.getenv("AIRTABLE_TOKEN")
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-TBL_MESSAGES     = os.getenv("TBL_MESSAGES", "Messages")
-TBL_META         = os.getenv("TBL_META", "Meta")
-TBL_IMAGES       = os.getenv("TBL_IMAGES")  # optional
+COL_META_CODE       = os.getenv("COL_META_CODE", "MaNoi")
+COL_META_NAME       = os.getenv("COL_META_NAME", "TenNoi")
+COL_META_KEY        = os.getenv("COL_META_KEY", "Key")
+COL_META_VAL        = os.getenv("COL_META_VAL", "Value")
 
-api = Api(AIRTABLE_TOKEN) if AIRTABLE_TOKEN else None
-tbl_messages = api.table(AIRTABLE_BASE_ID, TBL_MESSAGES) if api else None
-tbl_meta     = api.table(AIRTABLE_BASE_ID, TBL_META) if api else None
-tbl_images   = api.table(AIRTABLE_BASE_ID, TBL_IMAGES) if (api and TBL_IMAGES) else None
+# Bảng IMAGES (nếu dùng)
+COL_IMG_HASH        = os.getenv("COL_IMG_HASH", "FileUniqueId")
+COL_IMG_CODE        = os.getenv("COL_IMG_CODE", "Code")
+COL_IMG_DATE        = os.getenv("COL_IMG_DATE", "Date")
 
-VN_TZ = timezone(timedelta(hours=7))
-FORMAT_RE = re.compile(r"^\s*\d{8}\s*-\s*[^\s].+$", re.UNICODE)
+VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
+CODE_RE = re.compile(r"^(\d{8})\s*-\s*", re.UNICODE)
 
-# === Reply texts (đÃ thay icon) ===
-MSG_OK       = "🆗Đã ghi nhận báo cáo 5s ngày hôm nay"
-MSG_DUP_IMG  = "⛔️Ảnh gửi có dấu hiệu trùng với trước đây, nhờ kiểm tra lại"
-MSG_BAD_FMT  = "🆕Kiểm tra lại format và gửi báo cáo lại"
+# Reply messages (đã chỉnh theo yêu cầu trước đó)
+MSG_OK      = "🆗Đã ghi nhận báo cáo 5s ngày hôm nay"
+MSG_BADFMT  = "🆕Kiểm tra lại format và gửi báo cáo lại"
+MSG_DUPIMG  = "⛔️Ảnh gửi có dấu hiệu trùng với trước đây, nhờ kiểm tra lại"
 
-# tránh reply nhiều lần cho 1 album trong 1 vòng xử lý
-PROCESSED_MEDIA_GROUP_IDS = set()
+# ================== Utils ==================
+def _today_vn():
+    return datetime.datetime.now(VN_TZ).date()
 
-# ===== Utils =====
-def is_valid_format(text: str) -> bool:
-    return bool(text and FORMAT_RE.match(text))
-
-def now_vn_iso() -> str:
-    return datetime.now(VN_TZ).isoformat(timespec="seconds")
-
-def safe_get_fields(rec) -> dict:
-    if isinstance(rec, dict):
-        return rec.get("fields", {}) or {}
-    if isinstance(rec, list):
-        for r in rec:
-            if isinstance(r, dict):
-                return r.get("fields", {}) or {}
-    return {}
-
-def _parse_any_dt(s: str) -> Optional[datetime]:
-    if not s:
+def _iso_local(dttm_str: str):
+    try:
+        return datetime.datetime.fromisoformat(dttm_str.replace("Z","+00:00")).astimezone(VN_TZ)
+    except Exception:
         return None
-    s = str(s).strip()
-    try:
-        if s.endswith("Z"):
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return datetime.fromisoformat(s)
-    except Exception:
-        pass
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
-                "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S",
-                "%Y-%m-%d"):
-        try:
-            return datetime.strptime(s, fmt).replace(tzinfo=VN_TZ)
-        except Exception:
-            continue
-    return None
 
-def _pick_text(fields: dict) -> str:
-    for k in ("text", "Text", "message", "Message", "caption", "Caption"):
-        if k in fields and fields[k]:
-            return str(fields[k])
-    return ""
+def _air_table(name):
+    return Table(AIRTABLE_TOKEN, AIRTABLE_BASE_ID, name)
 
-# ===== Airtable IO =====
-def insert_message_record(chat_id, user_id, username, text, ok, msg_id, media_group_id):
-    if not (tbl_messages and ok):
-        return
-    fields = {
-        "DateTime": now_vn_iso(),
-        "UserID": str(user_id),
-        "Username": username or "",
-        "Message": text or "",
-        # có thể bổ sung các cột khác nếu bảng có sẵn
-    }
-    try:
-        tbl_messages.create(fields)
-    except Exception as e:
-        log.error("Insert to Airtable failed: %s", e)
-
-# --- Lưu/kiểm tra ảnh đã thấy trước đây ---
-def images_seen(uids: List[str]) -> Tuple[bool, List[str]]:
-    existed = []
-    if tbl_images:
-        for uid in set(uids):
-            try:
-                rec = tbl_images.first(formula=match({"file_unique_id": uid}))
-                if rec:
-                    existed.append(uid)
-            except Exception as e:
-                log.warning("images_seen check error: %s", e)
-    elif tbl_meta:
-        for uid in set(uids):
-            try:
-                rec = tbl_meta.first(formula=match({"key": f"img:{uid}"})) or tbl_meta.first(formula=match({"Key": f"img:{uid}"}))
-                if rec:
-                    existed.append(uid)
-            except Exception as e:
-                log.warning("meta images_seen error: %s", e)
-    return (len(existed) > 0, existed)
-
-def save_images_fingerprints(uids: List[str], chat_id, user_id, caption: str, media_group_id, message_id):
-    unique = list(set(uids))
-    if tbl_images:
-        for uid in unique:
-            body = {
-                "file_unique_id": uid,
-                "DateTime": now_vn_iso(),
-                "chat_id": str(chat_id),
-                "user_id": str(user_id),
-                "caption": caption or "",
-                "media_group_id": str(media_group_id) if media_group_id else "",
-                "message_id": str(message_id),
-            }
-            try:
-                tbl_images.create(body)
-            except Exception as e:
-                log.warning("save_images_fingerprints error: %s", e)
-    elif tbl_meta:
-        for uid in unique:
-            key = f"img:{uid}"
-            try:
-                rec = tbl_meta.first(formula=match({"key": key})) or tbl_meta.first(formula=match({"Key": key}))
-                body = {"key": key, "value": now_vn_iso()}
-                if rec:
-                    tbl_meta.update(rec["id"], body, replace=False)
-                else:
-                    tbl_meta.create(body)
-            except Exception as e:
-                log.warning("meta save image error: %s", e)
-
-# ===== Telegram HTTP =====
-def _tg_api(method: str, payload: dict):
+def _tg(method: str, **kwargs):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    data = json.dumps(payload).encode("utf-8")
-    req = Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    r = requests.post(url, json=kwargs, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-def tg_send_message(chat_id, text, reply_to: Optional[int] = None):
-    body = {"chat_id": chat_id, "text": text}
-    if reply_to:
-        body["reply_to_message_id"] = reply_to
-    try:
-        _tg_api("sendMessage", body)
-    except HTTPError as e:
-        log.error("Telegram HTTPError %s: %s", e.code, e.read().decode("utf-8", "ignore"))
-    except URLError as e:
-        log.error("Telegram URLError: %s", e)
+def _send_reply(chat_id: str, reply_to_message_id: int, text: str):
+    return _tg("sendMessage",
+               chat_id=chat_id,
+               text=text,
+               reply_to_message_id=reply_to_message_id,
+               allow_sending_without_reply=True)
 
-def tg_get_updates(offset: Optional[int] = None):
-    body = {"timeout": 0, "allowed_updates": ["message"]}
-    if offset is not None:
-        body["offset"] = offset
-    try:
-        return _tg_api("getUpdates", body)
-    except Exception as e:
-        log.error("getUpdates error: %s", e)
-        return {"ok": False, "result": []}
+def _send_markdown(chat_id: str, text: str):
+    return _tg("sendMessage",
+               chat_id=chat_id,
+               text=text,
+               parse_mode="Markdown")
 
-# ===== Daily Report =====
-def fetch_today_records() -> List[Dict]:
-    if not tbl_messages:
-        log.warning("Airtable not configured; cannot fetch today records")
-        return []
-    today_start = datetime.now(VN_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    today_end = today_start + timedelta(days=1)
-    try:
-        records = tbl_messages.all(page_size=100, max_records=1000)
-    except Exception as e:
-        log.error("Airtable fetch failed: %s", e)
-        return []
+# ================== Meta KV in Airtable ==================
+def _meta_get(key: str) -> str:
+    tbl = _air_table(TBL_META)
+    recs = tbl.all(formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'".format(COL_META_KEY=COL_META_KEY))
+    return recs[0]["fields"].get(COL_META_VAL, "") if recs else ""
 
-    results = []
-    for rec in records:
-        f = safe_get_fields(rec)
-        ts = f.get("created_at") or f.get("DateTime") or f.get("datetime") or f.get("Created At") or rec.get("createdTime")
-        dt = _parse_any_dt(ts) if ts else None
-        if not dt:
-            continue
-        if not dt.tzinfo:
-            dt = dt.replace(tzinfo=VN_TZ)
-        if today_start <= dt.astimezone(VN_TZ) < today_end:
-            results.append(rec)
-    return results
-
-def build_summary(records: List[Dict]) -> str:
-    total = 0
-    by_chat = defaultdict(int)
-    for rec in records:
-        f = safe_get_fields(rec)
-        ok = bool(f.get("is_valid")) if "is_valid" in f else is_valid_format(_pick_text(f))
-        if not ok:
-            continue
-        cid = f.get("chat_id") or f.get("ChatID") or f.get("Chat Id") or "unknown"
-        by_chat[str(cid)] += 1
-        total += 1
-
-    lines = [f"BÁO CÁO 5S - {datetime.now(VN_TZ).strftime('%d/%m/%Y')}"]
-    lines.append(f"Tổng báo cáo hợp lệ: {total}")
-    if by_chat:
-        lines.append("Theo room:")
-        for cid, cnt in sorted(by_chat.items()):
-            lines.append(f" - Chat {cid}: {cnt}")
-    return "\n".join(lines)
-
-def send_daily_report():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Missing secrets: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID", file=sys.stderr)
-        sys.exit(1)
-    report_text = build_summary(fetch_today_records())
-    print(report_text)
-    tg_send_message(TELEGRAM_CHAT_ID, report_text)
-
-# ===== Collector (quét getUpdates, phát hiện ảnh trùng) =====
-def run_collector_once():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Missing secrets: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID", file=sys.stderr)
-        sys.exit(1)
-
-    last_val, rec_id = meta_get("last_update_id") if tbl_meta else (None, None)
-    try:
-        offset = int(last_val) + 1 if (last_val is not None and str(last_val).isdigit()) else None
-    except Exception:
-        offset = None
-
-    data = tg_get_updates(offset)
-    updates = data.get("result", [])
-
-    groups: Dict[str, List[dict]] = {}
-    for upd in updates:
-        msg = upd.get("message") or {}
-        if not msg:
-            continue
-        chat = msg.get("chat") or {}
-        if str(chat.get("id")) != str(TELEGRAM_CHAT_ID):
-            continue
-        key = msg.get("media_group_id") or f"single:{msg.get('message_id')}"
-        groups.setdefault(key, []).append(msg)
-
-    last_update_id = None
-    for upd in updates:
-        last_update_id = upd.get("update_id", last_update_id)
-
-    for key, msgs in groups.items():
-        caption = ""
-        for m in msgs:
-            caption = m.get("caption") or m.get("text") or caption
-            if caption:
-                break
-
-        uids: List[str] = []
-        for m in msgs:
-            if "photo" in m and isinstance(m["photo"], list) and m["photo"]:
-                uids.append(m["photo"][-1].get("file_unique_id"))
-            if "document" in m:
-                doc = m["document"]
-                mime = (doc.get("mime_type") or "")
-                if mime.startswith("image/"):
-                    uids.append(doc.get("file_unique_id"))
-        uids = [u for u in uids if u]
-
-        first_msg_id = msgs[0].get("message_id")
-        chat_id = msgs[0].get("chat", {}).get("id")
-        user = msgs[0].get("from") or {}
-        user_id = user.get("id", 0)
-        username = user.get("username", "")
-
-        if uids and caption:
-            has_dup, existed = images_seen(uids)
-            if has_dup:
-                tg_send_message(chat_id, MSG_DUP_IMG, reply_to=first_msg_id)
-                continue
-            ok = is_valid_format(caption)
-            if ok:
-                insert_message_record(chat_id, user_id, username, caption, True, first_msg_id, msgs[0].get("media_group_id"))
-                tg_send_message(chat_id, MSG_OK, reply_to=first_msg_id)
-                save_images_fingerprints(uids, chat_id, user_id, caption, msgs[0].get("media_group_id"), first_msg_id)
-            else:
-                tg_send_message(chat_id, MSG_BAD_FMT, reply_to=first_msg_id)
-        else:
-            text = caption or (msgs[0].get("text") or "")
-            if not text:
-                continue
-            ok = is_valid_format(text)
-            if ok:
-                insert_message_record(chat_id, user_id, username, text, True, first_msg_id, msgs[0].get("media_group_id"))
-                tg_send_message(chat_id, MSG_OK, reply_to=first_msg_id)
-            else:
-                tg_send_message(chat_id, MSG_BAD_FMT, reply_to=first_msg_id)
-
-    if last_update_id is not None and tbl_meta:
-        meta_upsert("last_update_id", last_update_id, rec_id=rec_id)
-
-# ===== Meta helpers =====
-def meta_get(key: str):
-    if not tbl_meta:
-        return None, None
-    try:
-        rec = tbl_meta.first(formula=match({"key": key})) or tbl_meta.first(formula=match({"Key": key}))
-        if rec:
-            f = safe_get_fields(rec)
-            val = f.get("value") or f.get("Value")
-            return val, rec.get("id")
-    except Exception as e:
-        log.warning("Meta get error: %s", e)
-    return None, None
-
-def meta_upsert(key: str, value, rec_id: Optional[str] = None):
-    if not tbl_meta:
-        return
-    body = {"key": key, "value": str(value)}
-    try:
-        if rec_id:
-            tbl_meta.update(rec_id, body, replace=False)
-            return
-        rec = tbl_meta.first(formula=match({"key": key})) or tbl_meta.first(formula=match({"Key": key}))
-        if rec:
-            tbl_meta.update(rec["id"], body, replace=False)
-        else:
-            tbl_meta.create(body)
-    except Exception as e:
-        log.warning("Meta upsert error: %s", e)
-
-# ===== Bot realtime (chỉ khi --bot) =====
-def run_bot_polling():
-    if not TELEGRAM_BOT_TOKEN:
-        log.error("TELEGRAM_BOT_TOKEN is required to run bot")
-        sys.exit(1)
-
-    from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters  # lazy import
-
-    async def start_cmd(update, context):
-        await update.message.reply_text("Bot sẵn sàng. Gửi báo cáo theo dạng `12345678 - Nội dung` nhé!")
-
-    async def reply_once_for_media_group(update, context, reply_text: str):
-        msg = update.effective_message
-        mgid = msg.media_group_id
-        if mgid:
-            if mgid in PROCESSED_MEDIA_GROUP_IDS:
-                return
-            PROCESSED_MEDIA_GROUP_IDS.add(mgid)
-            await msg.reply_text(reply_text)
-        else:
-            await msg.reply_text(reply_text)
-
-    async def handle_message(update, context):
-        msg = update.effective_message
-        chat = update.effective_chat
-        user = update.effective_user
-
-        text = msg.caption if getattr(msg, "caption", None) else (msg.text or "")
-        if not text:
-            return
-
-        ok = is_valid_format(text)
-        if ok:
-            insert_message_record(
-                chat_id=chat.id,
-                user_id=user.id if user else 0,
-                username=(user.username if user and user.username else ""),
-                text=text,
-                ok=True,
-                msg_id=msg.id,
-                media_group_id=msg.media_group_id,
-            )
-            await reply_once_for_media_group(update, context, MSG_OK)
-        else:
-            await reply_once_for_media_group(update, context, MSG_BAD_FMT)
-
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO, handle_message))
-    log.info("Bot is running (polling)...")
-    app.run_polling(close_loop=False)
-
-# ===== Entrypoint =====
-if __name__ == "__main__":
-    in_actions      = os.getenv("GITHUB_ACTIONS") == "true"
-    force_daily     = ("--daily" in sys.argv)     or (os.getenv("RUN_DAILY") == "1")
-    force_collector = ("--collector" in sys.argv) or (os.getenv("RUN_COLLECTOR") == "1")
-    force_bot       = ("--bot" in sys.argv)
-
-    if force_bot:
-        run_bot_polling()
-    elif force_collector:
-        run_collector_once()
-    elif force_daily or in_actions:
-        send_daily_report()
+def _meta_set(key: str, val: str):
+    tbl = _air_table(TBL_META)
+    recs = tbl.all(formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'".format(COL_META_KEY=COL_META_KEY))
+    if recs:
+        tbl.update(recs[0]["id"], {COL_META_VAL: val})
     else:
-        run_bot_polling()
+        tbl.create({COL_META_KEY: key, COL_META_VAL: val})
+
+# ================== Collect logic (15') ==================
+def _extract_code(text: str) -> str:
+    if not text:
+        return ""
+    m = CODE_RE.match(text.strip())
+    return m.group(1) if m else ""
+
+def _photo_unique_ids(photo_sizes: List[Dict[str,Any]]) -> List[str]:
+    # Telegram trả mảng các size; mỗi size có file_unique_id
+    ids = []
+    for ph in photo_sizes or []:
+        u = ph.get("file_unique_id")
+        if u: ids.append(u)
+    # lọc unique
+    return list(dict.fromkeys(ids))
+
+def _is_duplicate_photo(ids: List[str]) -> bool:
+    if not TBL_IMAGES or not ids:
+        return False
+    tbl = _air_table(TBL_IMAGES)
+    # nếu bất kỳ file_unique_id đã tồn tại -> coi là trùng
+    for uid in ids:
+        recs = tbl.all(formula=f"{{{COL_IMG_HASH}}} = '{uid}'")
+        if recs:
+            return True
+    return False
+
+def _save_photo_ids(code: str, ids: List[str]):
+    if not TBL_IMAGES or not ids:
+        return
+    tbl = _air_table(TBL_IMAGES)
+    today = _today_vn().isoformat()
+    for uid in ids:
+        tbl.create({COL_IMG_HASH: uid, COL_IMG_CODE: code, COL_IMG_DATE: today})
+
+def _save_message(record: Dict[str,Any]):
+    _air_table(TBL_MESSAGES).create(record)
+
+def collect_once():
+    """
+    Lấy update từ Telegram bằng getUpdates, dùng offset lưu trong Meta.Key='last_update_id'.
+    - Chỉ xử lý message thuộc group CHAT_ID bạn cấu hình.
+    - Một caption có nhiều ảnh -> chỉ reply 1 lần (theo message_id).
+    - Sai format -> reply MSG_BADFMT, KHÔNG ghi Airtable.
+    - Đúng format -> kiểm trùng ảnh (nếu bật TBL_IMAGES). Nếu trùng -> reply MSG_DUPIMG, vẫn ghi nhận text hợp lệ? (theo yêu cầu trước đây: trùng ảnh thì cảnh báo, còn flow bình thường vẫn chạy)
+    """
+    offset = _meta_get("last_update_id")
+    offset = int(offset) + 1 if offset else None
+
+    resp = _tg("getUpdates", timeout=10, allowed_updates=["message"], offset=offset)
+    updates = resp.get("result", [])
+
+    last_id = None
+    for u in updates:
+        last_id = u.get("update_id", last_id)
+        msg = u.get("message") or {}
+        chat = msg.get("chat", {})
+        chat_id = str(chat.get("id", ""))
+        if not chat_id or chat_id != str(TELEGRAM_CHAT_ID):
+            continue
+
+        message_id = msg.get("message_id")
+        text = msg.get("text", "")
+        caption = msg.get("caption", "")
+        photos = msg.get("photo", [])  # mảng photo sizes nếu có
+        from_user = msg.get("from", {})
+        sender = f'{from_user.get("first_name","")} {from_user.get("last_name","")}'.strip() or from_user.get("username","")
+
+        content = caption if caption else text
+        code = _extract_code(content)
+
+        if not code:
+            # Sai format -> reply và bỏ qua ghi Airtable
+            _send_reply(chat_id, message_id, MSG_BADFMT)
+            continue
+
+        # Kiểm tra trùng ảnh nếu có ảnh
+        photo_ids = _photo_unique_ids(photos)
+        is_dup = _is_duplicate_photo(photo_ids)
+
+        if is_dup:
+            _send_reply(chat_id, message_id, MSG_DUPIMG)
+
+        # Ghi nhận hợp lệ (chỉ 1 bản ghi cho cả message, kể cả nhiều ảnh)
+        record = {
+            COL_MSG_TEXT: content,
+            COL_MSG_CODE: code,
+            COL_MSG_CHAT: chat_id,
+            COL_MSG_USER: sender,
+            COL_MSG_TG_MSG_ID: message_id,
+            COL_MSG_TS: datetime.datetime.now(VN_TZ).isoformat()
+        }
+        _save_message(record)
+        _save_photo_ids(code, photo_ids)
+
+        # Trả lời xác nhận (chỉ 1 lần cho message này)
+        _send_reply(chat_id, message_id, MSG_OK)
+
+    if last_id is not None:
+        _meta_set("last_update_id", str(last_id))
+
+# ================== Daily report 21h ==================
+def _get_master_codes():
+    tbl = _air_table(TBL_META)
+    # Lấy tất cả MaNoi/TenNoi (KHÔNG lấy các dòng Meta dạng key-value)
+    recs = tbl.all(fields=[COL_META_CODE, COL_META_NAME])
+    codes, name_map = [], {}
+    for r in recs:
+        f = r.get("fields", {})
+        code = str(f.get(COL_META_CODE, "")).strip()
+        if code:  # chỉ tính những dòng có MaNoi
+            codes.append(code)
+            name_map[code] = str(f.get(COL_META_NAME, "")).strip()
+    return codes, name_map
+
+def _get_today_messages():
+    tbl = _air_table(TBL_MESSAGES)
+    recs = tbl.all()
+    today = _today_vn()
+    items = []
+    for r in recs:
+        f = r.get("fields", {})
+        text = str(f.get(COL_MSG_TEXT, "")).strip()
+        code = str(f.get(COL_MSG_CODE, "")).strip()
+        ts   = f.get(COL_MSG_TS) or r.get("createdTime")
+        ts_dt = _iso_local(ts) if isinstance(ts, str) else ts
+        if not code or not ts_dt:
+            # thử cứu code từ text
+            if not code and text:
+                m = CODE_RE.match(text)
+                if m:
+                    code = m.group(1)
+                    ts_dt = _iso_local(str(ts)) if ts else None
+                else:
+                    continue
+        if not ts_dt:
+            continue
+        if ts_dt.astimezone(VN_TZ).date() == today:
+            items.append({"code": code, "text": text, "ts": ts_dt})
+    return items
+
+def _pick_latest_per_code(items):
+    latest = {}
+    for it in items:
+        c = it["code"]
+        if c not in latest or it["ts"] > latest[c]["ts"]:
+            latest[c] = it
+    # trả theo code để ổn định
+    return [latest[c] for c in sorted(latest.keys())]
+
+def _format_table(col1_list: List[str], col2_list: List[str]) -> str:
+    head1 = "Text/Caption đã gửi"
+    head2 = "Những nơi chưa gửi"
+    col1 = col1_list[:] if col1_list else ["(trống)"]
+    col2 = col2_list[:] if col2_list else ["(đủ)"]
+    w1 = max(len(head1), max((len(x) for x in col1), default=0))
+    w2 = max(len(head2), max((len(x) for x in col2), default=0))
+    line = f"+{'-'*(w1+2)}+{'-'*(w2+2)}+"
+    header = f"| {head1.ljust(w1)} | {head2.ljust(w2)} |"
+    rows = []
+    n = max(len(col1), len(col2))
+    for i in range(n):
+        c1 = col1[i] if i < len(col1) else ""
+        c2 = col2[i] if i < len(col2) else ""
+        rows.append(f"| {c1.ljust(w1)} | {c2.ljust(w2)} |")
+    return "\n".join([line, header, line, *rows, line])
+
+def run_daily_report():
+    today_str = _today_vn().strftime("%d/%m/%Y")
+    master_codes, name_map = _get_master_codes()
+    items_today = _get_today_messages()
+
+    latest = _pick_latest_per_code(items_today)
+    sent_codes = {it["code"] for it in latest}
+
+    # Cột 1: caption mới nhất / nơi
+    col1_vals = []
+    for it in latest:
+        txt = (it["text"] or "").replace("\n", " ")
+        if len(txt) > 120:
+            txt = txt[:117] + "..."
+        col1_vals.append(txt)
+
+    # Cột 2: nơi chưa gửi
+    missing = [c for c in master_codes if c not in sent_codes]
+    col2_vals = [f"{c} - {name_map.get(c,'')}".strip().rstrip(" -") for c in missing]
+
+    table = _format_table(col1_vals, col2_vals)
+    msg = f"📊 *Báo cáo 21h* (ngày {today_str})\n```\n{table}\n```"
+    _send_markdown(TELEGRAM_CHAT_ID, msg)
+
+# ================== Main ==================
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--collect", action="store_true", help="Poll Telegram & record messages")
+    parser.add_argument("--daily", action="store_true", help="Send 21h report")
+    args = parser.parse_args()
+
+    if args.daily:
+        run_daily_report()
+    else:
+        # Mặc định collector để khớp workflow 15' (hoặc dùng --collect)
+        collect_once()
