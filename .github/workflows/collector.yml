@@ -13,19 +13,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
-    # Map secrets của bạn -> ENV mà bot.py cần
+    # Map secrets -> ENV cho bot.py
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}              # token bot
-      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}               # chat id nhóm (dạng -100...)
+      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}           # token bot
+      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}            # chat id nhóm (dạng -100...)
       AIRTABLE_TOKEN:     ${{ secrets.AIRTABLE_TOKEN }}
       AIRTABLE_BASE_ID:   ${{ secrets.AIRTABLE_BASE_ID }}
-      TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }} # ví dụ: "Messages"
-      TBL_META:           ${{ secrets.AIRTABLE_TABLE_META }}     # ví dụ: "Meta"
-      # (tuỳ chọn) nếu tạo bảng lưu dấu vết ảnh trùng:
-      # TBL_IMAGES:         ${{ secrets.AIRTABLE_TABLE_IMAGES }} # ví dụ: "Images"
+      TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }}   # ví dụ: "Messages"
+      TBL_META:           ${{ secrets.AIRTABLE_TABLE_META }}       # ví dụ: "Meta"
+      # (tuỳ chọn) nếu dùng bảng lưu dấu vết ảnh trùng:
+      # TBL_IMAGES:         ${{ secrets.AIRTABLE_TABLE_IMAGES }}    # ví dụ: "Images"
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -33,10 +34,9 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pyairtable
+          pip install -r requirements.txt
 
-      # chạy 1 vòng collector: quét getUpdates -> kiểm tra ảnh trùng -> reply -> thoát
       - name: Run collector (scan & reply once)
         run: |
           set -e
-          python -u bot.py --collector
+          python -u bot.py --collect
