@@ -13,16 +13,33 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
-    # Map secrets -> ENV cho bot.py
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}           # token bot
-      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}            # chat id nhóm (dạng -100...)
+      # Telegram & Airtable
+      TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}
       AIRTABLE_TOKEN:     ${{ secrets.AIRTABLE_TOKEN }}
       AIRTABLE_BASE_ID:   ${{ secrets.AIRTABLE_BASE_ID }}
-      TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }}   # ví dụ: "Messages"
-      TBL_META:           ${{ secrets.AIRTABLE_TABLE_META }}       # ví dụ: "Meta"
-      # (tuỳ chọn) nếu dùng bảng lưu dấu vết ảnh trùng:
-      # TBL_IMAGES:         ${{ secrets.AIRTABLE_TABLE_IMAGES }}    # ví dụ: "Images"
+
+      # Tên bảng trong Airtable
+      TBL_MESSAGES: ${{ secrets.AIRTABLE_TABLE_MESSAGES }}   # ví dụ: "Messages"
+      TBL_META:     ${{ secrets.AIRTABLE_TABLE_META }}       # ví dụ: "Meta"
+      TBL_IMAGES:   ${{ secrets.AIRTABLE_TABLE_IMAGES }}     # ví dụ: "Images"  <-- BẬT CHỐNG TRÙNG ẢNH
+
+      # (tuỳ chọn) nếu bạn đổi tên cột ở bảng Images, bỏ comment và sửa cho khớp
+      # COL_IMG_HASH: FileUniqueId   # cột UID ảnh
+      # COL_IMG_CODE: Code           # cột mã nơi
+      # COL_IMG_DATE: Date           # cột ngày
+
+      # (tuỳ chọn) nếu bạn đổi tên cột ở bảng Messages
+      # COL_MSG_TEXT: TextOrCaption
+      # COL_MSG_CODE: Code
+      # COL_MSG_TS:   Timestamp
+
+      # (tuỳ chọn) nếu bạn đổi tên cột ở bảng Meta
+      # COL_META_CODE: MaNoi
+      # COL_META_NAME: TenNoi
+      # COL_META_KEY:  Key
+      # COL_META_VAL:  Value
 
     steps:
       - uses: actions/checkout@v4
