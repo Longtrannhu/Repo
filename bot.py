@@ -25,12 +25,11 @@ TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional: bật ch�
 # Tên cột Messages (có thể override qua ENV)
 COL_MSG_TEXT        = os.getenv("COL_MSG_TEXT", "TextOrCaption")
 COL_MSG_CODE        = os.getenv("COL_MSG_CODE", "Code")
-COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")  # chỉ dùng khi ĐỌC; khi CREATE bỏ qua
+COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")  # chỉ dùng khi ĐỌC
 
 # Danh sách nơi bắt buộc (Meta)
 COL_META_CODE       = os.getenv("COL_META_CODE", "MaNoi")
 COL_META_NAME       = os.getenv("COL_META_NAME", "TenNoi")
-# KV (lưu offset, warned caps) – có thể không tồn tại, sẽ fallback qua MaNoi/TenNoi
 COL_META_KEY        = os.getenv("COL_META_KEY", "Key")
 COL_META_VAL        = os.getenv("COL_META_VAL", "Value")
 
@@ -77,7 +76,7 @@ def _send_reply(chat_id: str, reply_to_message_id: int, text: str):
                allow_sending_without_reply=True)
 
 def _send_markdown(chat_id: str, text: str):
-    # Giữ lại nếu muốn dùng chỗ khác
+    # Giữ lại nếu muốn dùng chỗ khác (báo cáo dùng HTML)
     return _tg("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown")
 
 # ---- HTML helpers (an toàn, tránh 400 Bad Request) ----
@@ -93,9 +92,7 @@ def _send_html(chat_id: str, html: str):
     return _tg("sendMessage", chat_id=chat_id, text=html, parse_mode="HTML")
 
 def _send_long_html(chat_id: str, html: str, limit: int = 3900):
-    """
-    Telegram giới hạn ~4096 ký tự. Tự cắt theo dòng để gửi nhiều phần.
-    """
+    """Telegram limit ~4096. Cắt theo dòng và gửi nhiều phần."""
     text = html
     while len(text) > limit:
         cut = text.rfind("\n", 0, limit)
@@ -163,7 +160,6 @@ def _parse_hash_list(s: str) -> Set[str]:
 def _serialize_hash_list(vals: Set[str]) -> str:
     if not vals:
         return ""
-    # giới hạn kích thước tránh quá dài (hiếm khi cần)
     return ",".join(sorted(vals))[:9000]
 
 def _load_warned_caps_persist() -> Set[str]:
@@ -212,7 +208,32 @@ def _save_photo_ids(code: str, ids: List[str], seen: Set[str]):
 def _hash_caption(text: str) -> str:
     return hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()
 
-# ===== Collector (15') — GỘP THEO media_group_id & DEDUP & PERSIST WARN =====
+def _load_today_caption_hashes() -> Set[str]:
+    """
+    Trả về tập hash (SHA1) của caption đã ĐƯỢC LƯU trong bảng Messages trong NGÀY HÔM NAY.
+    Dùng để chặn gửi trùng theo caption (fallback khi không có table Images).
+    """
+    tbl = _air_table(TBL_MESSAGES)
+    try:
+        recs = tbl.all(fields=[COL_MSG_TEXT])
+    except HTTPError:
+        return set()
+
+    today = _today_vn()
+    hashes: Set[str] = set()
+    for r in recs:
+        fields = r.get("fields", {}) or {}
+        created = r.get("createdTime")
+        ts_dt = _iso_local(created) if isinstance(created, str) else created
+        if not ts_dt:
+            continue
+        if ts_dt.astimezone(VN_TZ).date() == today:
+            caption = fields.get(COL_MSG_TEXT, "")
+            h = hashlib.sha1((caption or "").strip().encode("utf-8")).hexdigest()
+            hashes.add(h)
+    return hashes
+
+# ===== Collector (15') — GỘP ALBUM & DEDUP & PERSIST WARN =====
 def _extract_code(text: str) -> str:
     if not text:
         return ""
@@ -225,7 +246,7 @@ def collect_once():
 
     # bộ nhớ trùng
     seen_uids = _load_seen_uids()
-    seen_caps_day = _load_today_caption_hashes()       # caption đã LƯU (Messages) trong ngày
+    seen_caps_day = _load_today_caption_hashes()       # caption đã LƯU trong ngày
     warned_caps_day = _load_warned_caps_persist()      # caption đã CẢNH BÁO trong ngày (persist)
     warned_caps_session: Set[str] = set()              # caption cảnh báo trong phiên (chống spam)
 
@@ -281,7 +302,7 @@ def collect_once():
 
         photo_ids = _photo_unique_ids(photos)
 
-        # Trùng ảnh hoặc caption (đã ghi / đã cảnh báo) -> cảnh báo 1 lần/ngày
+        # Trùng ảnh hoặc caption -> cảnh báo 1 lần/ngày
         if _is_duplicate_photo(photo_ids, seen_uids) or ch in seen_caps_day or ch in warned_caps_day:
             if content and should_warn(ch):
                 _send_reply(chat_id, message_id, MSG_DUPIMG)
