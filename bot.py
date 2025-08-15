@@ -1,4 +1,23 @@
-# bot.py  — compatible with pyairtable 3.x
+# bot.py — Telegram collector + 21h report (Airtable, pyairtable 3.x)
+# ---------------------------------------------------------------
+# Chức năng:
+# 1) --collect : quét tin nhắn trong group, kiểm tra format, cảnh báo trùng ảnh,
+#                trả lời theo yêu cầu và ghi Airtable.
+# 2) --daily   : gửi báo cáo 21h (2 cột: Caption đã gửi | Nơi chưa gửi).
+#
+# Yêu cầu Airtable:
+# - Table "Meta" có thể chứa cả:
+#   + Danh sách nơi bắt buộc: MaNoi (8 số), TenNoi (tuỳ chọn)
+#   + Cặp Key/Value (để lưu offset getUpdates): Key, Value
+# - Table "Messages": TextOrCaption, Code, Timestamp (tùy bạn đặt, có thể dùng Created Time)
+# - (tuỳ chọn) Table "Images": FileUniqueId, Code, Date (để check trùng ảnh)
+#
+# Env cần có (đã khớp với workflow của bạn):
+# BOT_TOKEN (hoặc TELEGRAM_BOT_TOKEN), GROUP_ID (hoặc TELEGRAM_CHAT_ID),
+# AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_MESSAGES, AIRTABLE_TABLE_META
+# (tuỳ chọn) AIRTABLE_TABLE_IMAGES
+# ---------------------------------------------------------------
+
 import os, re, datetime
 from typing import List, Dict, Any
 import pytz
@@ -13,18 +32,20 @@ AIRTABLE_TOKEN      = os.getenv("AIRTABLE_TOKEN")
 AIRTABLE_BASE_ID    = os.getenv("AIRTABLE_BASE_ID")
 TBL_MESSAGES        = os.getenv("TBL_MESSAGES", "Messages")
 TBL_META            = os.getenv("TBL_META", "Meta")
-TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional
+TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional: bảng lưu dấu vết ảnh
 
-# Tên cột trong Airtable (có thể override qua ENV để khớp schema hiện tại)
+# Tên cột trong Airtable (có thể override qua ENV để khớp schema)
 COL_MSG_TEXT        = os.getenv("COL_MSG_TEXT", "TextOrCaption")
 COL_MSG_CODE        = os.getenv("COL_MSG_CODE", "Code")
-COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")  # nếu không có, sẽ dùng createdTime
+COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")  # nếu thiếu, sẽ fallback createdTime
 COL_MSG_CHAT        = os.getenv("COL_MSG_CHAT", "ChatId")
 COL_MSG_USER        = os.getenv("COL_MSG_USER", "From")
 COL_MSG_TG_MSG_ID   = os.getenv("COL_MSG_TG_MSG_ID", "TelegramMessageId")
 
+# Dòng MaNoi/TenNoi trong Meta (danh sách nơi bắt buộc)
 COL_META_CODE       = os.getenv("COL_META_CODE", "MaNoi")
 COL_META_NAME       = os.getenv("COL_META_NAME", "TenNoi")
+# Dòng Key/Value trong Meta (lưu offset…)
 COL_META_KEY        = os.getenv("COL_META_KEY", "Key")
 COL_META_VAL        = os.getenv("COL_META_VAL", "Value")
 
@@ -80,16 +101,22 @@ def _send_markdown(chat_id: str, text: str):
 
 # ================== Meta KV (lưu offset getUpdates) ==================
 def _meta_get(key: str) -> str:
+    """
+    Đọc giá trị theo khóa 'key' trong bảng Meta (cột Key/Value).
+    """
     tbl = _air_table(TBL_META)
     recs = tbl.all(
-        filter_by_formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'".format(COL_META_KEY=COL_META_KEY)
+        filter_by_formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'"
     )
     return recs[0]["fields"].get(COL_META_VAL, "") if recs else ""
 
 def _meta_set(key: str, val: str):
+    """
+    Ghi/ cập nhật giá trị cho khóa 'key' trong bảng Meta (cột Key/Value).
+    """
     tbl = _air_table(TBL_META)
     recs = tbl.all(
-        filter_by_formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'".format(COL_META_KEY=COL_META_KEY)
+        filter_by_formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'"
     )
     if recs:
         tbl.update(recs[0]["id"], {COL_META_VAL: val})
@@ -192,6 +219,7 @@ def collect_once():
 # ================== DAILY REPORT (21h) ==================
 def _get_master_codes():
     tbl = _air_table(TBL_META)
+    # Lấy các dòng có MaNoi (bỏ qua dòng chỉ có Key/Value)
     recs = tbl.all(fields=[COL_META_CODE, COL_META_NAME])
     codes, name_map = [], {}
     for r in recs:
