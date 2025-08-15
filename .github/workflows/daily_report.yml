@@ -11,6 +11,7 @@ permissions:
 jobs:
   report:
     runs-on: ubuntu-latest
+
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       TELEGRAM_CHAT_ID:   ${{ secrets.GROUP_ID }}
@@ -18,14 +19,19 @@ jobs:
       AIRTABLE_BASE_ID:   ${{ secrets.AIRTABLE_BASE_ID }}
       TBL_MESSAGES:       ${{ secrets.AIRTABLE_TABLE_MESSAGES }}
       TBL_META:           ${{ secrets.AIRTABLE_TABLE_META }}
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pyairtable
+          pip install -r requirements.txt
+
       - name: Run report
         run: |
           set -e
