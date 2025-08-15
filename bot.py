@@ -1,7 +1,9 @@
 # bot.py — Telegram collector + 21h report (Airtable, pyairtable 3.x)
-# Fix: nếu ảnh trùng -> CẢNH BÁO & KHÔNG ghi vào Messages (bị loại khỏi báo cáo)
+# - Gộp album theo media_group_id
+# - Chống trùng ảnh (Images table) + fallback chống trùng caption trong ngày
+# - Báo cáo 21h gọn đẹp (Markdown)
 
-import os, re, datetime
+import os, re, datetime, hashlib
 from typing import List, Dict, Any, Set
 import pytz
 import requests
@@ -41,7 +43,7 @@ CODE8_RE = re.compile(r"^\d{8}$")
 
 MSG_OK      = "🆗Đã ghi nhận báo cáo 5s ngày hôm nay"
 MSG_BADFMT  = "🆕Kiểm tra lại format và gửi báo cáo lại"
-MSG_DUPIMG  = "⛔️Ảnh gửi có dấu hiệu trùng với trước đây, nhờ kiểm tra lại"
+MSG_DUPIMG  = "⛔️Ảnh/caption trùng với trước đây, nhờ kiểm tra lại"
 
 # ===== Airtable client (v3) =====
 _api = Api(AIRTABLE_TOKEN)
@@ -73,6 +75,18 @@ def _send_reply(chat_id: str, reply_to_message_id: int, text: str):
 
 def _send_markdown(chat_id: str, text: str):
     return _tg("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown")
+
+def _md_sanitize(s: str) -> str:
+    """Làm sạch chuỗi để không phá vỡ Markdown (Telegram Markdown v1)."""
+    if not s:
+        return ""
+    return (
+        s.replace("\\", "\\\\")
+         .replace("`", "'")
+         .replace("*", "\\*")
+         .replace("_", "\\_")
+         .replace("[", "\\[")
+    )
 
 # ===== Meta KV with fallback =====
 def _kv_find(tbl, key_field: str, val_field: str, key: str):
@@ -116,7 +130,7 @@ def _meta_set(key: str, val: str):
             continue
     return
 
-# ===== Images =====
+# ===== Dedup helpers =====
 def _photo_unique_ids(photo_sizes: List[Dict[str,Any]]) -> List[str]:
     ids = []
     for ph in (photo_sizes or []):
@@ -125,31 +139,58 @@ def _photo_unique_ids(photo_sizes: List[Dict[str,Any]]) -> List[str]:
             ids.append(u)
     return ids
 
-def _is_duplicate_photo(ids: List[str]) -> bool:
-    if not TBL_IMAGES or not ids:
-        return False
+def _load_seen_uids() -> Set[str]:
+    if not TBL_IMAGES:
+        return set()
     tbl = _air_table(TBL_IMAGES)
-    for uid in ids:
-        try:
-            recs = tbl.all(formula=f"{{{COL_IMG_HASH}}} = '{uid}'")
-            if recs:
-                return True
-        except HTTPError:
-            continue
-    return False
+    try:
+        recs = tbl.all(fields=[COL_IMG_HASH])
+    except HTTPError:
+        return set()
+    s = set()
+    for r in recs:
+        u = (r.get("fields") or {}).get(COL_IMG_HASH)
+        if u: s.add(u)
+    return s
 
-def _save_photo_ids(code: str, ids: List[str]):
+def _is_duplicate_photo(ids: List[str], seen: Set[str]) -> bool:
+    return any(uid in seen for uid in ids)
+
+def _save_photo_ids(code: str, ids: List[str], seen: Set[str]):
     if not TBL_IMAGES or not ids:
         return
     tbl = _air_table(TBL_IMAGES)
     today = _today_vn().isoformat()
     for uid in ids:
+        if uid in seen:  # tránh tạo trùng nhiều lần
+            continue
         tbl.create({COL_IMG_HASH: uid, COL_IMG_CODE: code, COL_IMG_DATE: today})
+        seen.add(uid)
 
-def _save_message(record: Dict[str,Any]):
-    _air_table(TBL_MESSAGES).create(record)
+def _hash_caption(text: str) -> str:
+    return hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()
 
-# ===== Collector (15') — GỘP THEO media_group_id & BỎ QUA ẢNH TRÙNG =====
+def _load_today_caption_hashes() -> Set[str]:
+    """Fallback dedup khi chưa bật Images table: chặn caption trùng trong ngày."""
+    tbl = _air_table(TBL_MESSAGES)
+    try:
+        recs = tbl.all(fields=[COL_MSG_TEXT])
+    except HTTPError:
+        return set()
+    today = _today_vn()
+    s = set()
+    for r in recs:
+        fields = r.get("fields", {})
+        created = r.get("createdTime")
+        ts_dt = _iso_local(created) if isinstance(created, str) else created
+        if not ts_dt:
+            continue
+        if ts_dt.astimezone(VN_TZ).date() == today:
+            h = _hash_caption(fields.get(COL_MSG_TEXT, ""))
+            s.add(h)
+    return s
+
+# ===== Collector (15') — GỘP THEO media_group_id & DEDUP =====
 def _extract_code(text: str) -> str:
     if not text:
         return ""
@@ -159,6 +200,10 @@ def _extract_code(text: str) -> str:
 def collect_once():
     offset = _meta_get("last_update_id")
     offset = int(offset) + 1 if offset else None
+
+    # tải bộ nhớ trùng để dùng trong phiên poll này
+    seen_uids = _load_seen_uids()
+    seen_caps = _load_today_caption_hashes()
 
     resp = _tg("getUpdates", timeout=10, allowed_updates=["message"], offset=offset)
     updates = resp.get("result", [])
@@ -200,13 +245,16 @@ def collect_once():
             continue
 
         photo_ids = _photo_unique_ids(photos)
-        # Nếu ảnh trùng -> CẢNH BÁO và BỎ QUA hoàn toàn (không ghi Messages)
-        if _is_duplicate_photo(photo_ids):
+        cap_hash = _hash_caption(content)
+
+        if _is_duplicate_photo(photo_ids, seen_uids) or cap_hash in seen_caps:
             _send_reply(chat_id, message_id, MSG_DUPIMG)
             continue
 
-        _save_message({COL_MSG_TEXT: content, COL_MSG_CODE: code})
-        _save_photo_ids(code, photo_ids)
+        # lưu
+        _air_table(TBL_MESSAGES).create({COL_MSG_TEXT: content, COL_MSG_CODE: code})
+        _save_photo_ids(code, photo_ids, seen_uids)
+        seen_caps.add(cap_hash)
         _send_reply(chat_id, message_id, MSG_OK)
 
     # ---- Xử lý album đã gom ----
@@ -221,13 +269,14 @@ def collect_once():
             _send_reply(chat_id, rep_id, MSG_BADFMT)
             continue
 
-        if _is_duplicate_photo(photo_ids):
+        cap_hash = _hash_caption(content)
+        if _is_duplicate_photo(photo_ids, seen_uids) or cap_hash in seen_caps:
             _send_reply(chat_id, rep_id, MSG_DUPIMG)
-            # KHÔNG ghi vào Messages để không lọt báo cáo
             continue
 
-        _save_message({COL_MSG_TEXT: content, COL_MSG_CODE: code})
-        _save_photo_ids(code, photo_ids)
+        _air_table(TBL_MESSAGES).create({COL_MSG_TEXT: content, COL_MSG_CODE: code})
+        _save_photo_ids(code, photo_ids, seen_uids)
+        seen_caps.add(cap_hash)
         _send_reply(chat_id, rep_id, MSG_OK)
 
     if last_update_id is not None:
@@ -279,43 +328,51 @@ def _pick_latest_per_code(items):
             latest[c] = it
     return [latest[c] for c in sorted(latest.keys())]
 
-def _format_table(col1_list: List[str], col2_list: List[str]) -> str:
-    head1 = "Text/Caption đã gửi"
-    head2 = "Những nơi chưa gửi"
-    col1 = col1_list[:] if col1_list else ["(trống)"]
-    col2 = col2_list[:] if col2_list else ["(đủ)"]
-    w1 = max(len(head1), max((len(x) for x in col1), default=0))
-    w2 = max(len(head2), max((len(x) for x in col2), default=0))
-    line = f"+{'-'*(w1+2)}+{'-'*(w2+2)}+"
-    header = f"| {head1.ljust(w1)} | {head2.ljust(w2)} |"
-    rows = []
-    n = max(len(col1), len(col2))
-    for i in range(n):
-        c1 = col1[i] if i < len(col1) else ""
-        c2 = col2[i] if i < len(col2) else ""
-        rows.append(f"| {c1.ljust(w1)} | {c2.ljust(w2)} |")
-    return "\n".join([line, header, line, *rows, line])
-
 def run_daily_report():
     today_str = _today_vn().strftime("%d/%m/%Y")
+
+    # 1) Lấy master list & tin đã gửi trong ngày
     master_codes, name_map = _get_master_codes()
     items_today = _get_today_messages()
-
-    latest = _pick_latest_per_code(items_today)
+    latest = _pick_latest_per_code(items_today)   # mỗi nơi lấy caption mới nhất
     sent_codes = {it["code"] for it in latest}
 
-    col1_vals = []
-    for it in latest:
-        txt = (it["text"] or "").replace("\n", " ")
-        if len(txt) > 120:
-            txt = txt[:117] + "..."
-        col1_vals.append(txt)
+    total = len(master_codes)
+    sent  = len(sent_codes)
+    miss  = max(total - sent, 0)
+    pct   = int(round((sent/total)*100)) if total else 0
 
+    # 2) Danh sách "đã gửi" (đẹp + ngắn gọn)
+    sent_lines = []
+    for it in sorted(latest, key=lambda x: x["code"]):
+        code = it["code"]
+        name = name_map.get(code, "")
+        txt  = (it["text"] or "").replace("\n", " ")
+        if len(txt) > 90:  # cắt gọn để nhìn gọn gàng
+            txt = txt[:87] + "..."
+        line = f"• ✅ `{code}` — `{_md_sanitize(name)}` — “{_md_sanitize(txt)}”"
+        sent_lines.append(line)
+
+    if not sent_lines:
+        sent_lines = ["_Chưa có nơi nào gửi trong hôm nay_"]
+
+    # 3) Danh sách "chưa gửi"
     missing = [c for c in master_codes if c not in sent_codes]
-    col2_vals = [f"{c} - {name_map.get(c,'')}".strip().rstrip(" -") for c in missing]
+    miss_lines = [f"• ❌ `{c}` — `{_md_sanitize(name_map.get(c, ''))}`".rstrip(" `") for c in missing]
+    if not miss_lines:
+        miss_lines = ["_Tất cả nơi đã gửi đầy đủ_"]
 
-    table = _format_table(col1_vals, col2_vals)
-    msg = f"📊 *Báo cáo 21h* (ngày {today_str})\n```\n{table}\n```"
+    # 4) Ghép message Markdown gọn đẹp
+    header = (
+        f"📊 *Báo cáo 21h* — {today_str}\n"
+        f"*Tổng quan:* Tổng `{total}` • ✅ Đã gửi `{sent}` • ❌ Thiếu `{miss}` • 📈 {pct}% đã gửi\n\n"
+    )
+    body1 = f"*1) Text/Caption đã gửi ({sent}):*\n" + "\n".join(sent_lines) + "\n\n"
+    body2 = f"*2) Những nơi chưa gửi ({miss}):*\n" + "\n".join(miss_lines)
+
+    msg = header + body1 + body2
+
+    # 5) Gửi
     _send_markdown(TELEGRAM_CHAT_ID, msg)
 
 # ===== Main =====
