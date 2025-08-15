@@ -1,5 +1,5 @@
 # bot.py — Telegram collector + 21h report (Airtable, pyairtable 3.x)
-# Fix: Gộp album (media_group_id) -> chỉ tính 1 caption cho nhiều ảnh
+# Fix: nếu ảnh trùng -> CẢNH BÁO & KHÔNG ghi vào Messages (bị loại khỏi báo cáo)
 
 import os, re, datetime
 from typing import List, Dict, Any, Set
@@ -16,7 +16,7 @@ AIRTABLE_TOKEN      = os.getenv("AIRTABLE_TOKEN")
 AIRTABLE_BASE_ID    = os.getenv("AIRTABLE_BASE_ID")
 TBL_MESSAGES        = os.getenv("TBL_MESSAGES", "Messages")
 TBL_META            = os.getenv("TBL_META", "Meta")
-TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional
+TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional: bật chống trùng ảnh
 
 # Tên cột Messages (có thể override qua ENV)
 COL_MSG_TEXT        = os.getenv("COL_MSG_TEXT", "TextOrCaption")
@@ -26,7 +26,7 @@ COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")  # chỉ dùng khi Đ
 # Danh sách nơi bắt buộc (Meta)
 COL_META_CODE       = os.getenv("COL_META_CODE", "MaNoi")
 COL_META_NAME       = os.getenv("COL_META_NAME", "TenNoi")
-# KV fallback (nếu bảng Meta có cột này thì dùng; nếu không -> fallback qua MaNoi/TenNoi)
+# KV (lưu offset) – có thể không tồn tại, sẽ fallback qua MaNoi/TenNoi
 COL_META_KEY        = os.getenv("COL_META_KEY", "Key")
 COL_META_VAL        = os.getenv("COL_META_VAL", "Value")
 
@@ -81,14 +81,12 @@ def _kv_find(tbl, key_field: str, val_field: str, key: str):
 
 def _meta_get(key: str) -> str:
     tbl = _air_table(TBL_META)
-    # Thử Key/Value trước
     try:
         recs, valf = _kv_find(tbl, COL_META_KEY, COL_META_VAL, key)
         if recs:
             return str(recs[0]["fields"].get(valf, ""))
     except HTTPError:
         pass
-    # Fallback dùng MaNoi/TenNoi
     try:
         recs, valf = _kv_find(tbl, COL_META_CODE, COL_META_NAME, key)
         if recs:
@@ -99,21 +97,18 @@ def _meta_get(key: str) -> str:
 
 def _meta_set(key: str, val: str):
     tbl = _air_table(TBL_META)
-    # 1) Cập nhật theo Key/Value nếu có
     try:
         recs, valf = _kv_find(tbl, COL_META_KEY, COL_META_VAL, key)
         if recs:
             tbl.update(recs[0]["id"], {valf: val}); return
     except HTTPError:
         recs = []
-    # 2) Cập nhật theo MaNoi/TenNoi nếu có
     try:
         recs, valf = _kv_find(tbl, COL_META_CODE, COL_META_NAME, key)
         if recs:
             tbl.update(recs[0]["id"], {valf: val}); return
     except HTTPError:
         recs = []
-    # 3) Tạo mới record (ưu tiên Key/Value; nếu fail thì dùng MaNoi/TenNoi)
     for kf, vf in [(COL_META_KEY, COL_META_VAL), (COL_META_CODE, COL_META_NAME)]:
         try:
             tbl.create({kf: key, vf: val}); return
@@ -154,7 +149,7 @@ def _save_photo_ids(code: str, ids: List[str]):
 def _save_message(record: Dict[str,Any]):
     _air_table(TBL_MESSAGES).create(record)
 
-# ===== Collector (15') — GỘP THEO media_group_id =====
+# ===== Collector (15') — GỘP THEO media_group_id & BỎ QUA ẢNH TRÙNG =====
 def _extract_code(text: str) -> str:
     if not text:
         return ""
@@ -162,18 +157,12 @@ def _extract_code(text: str) -> str:
     return m.group(1) if m else ""
 
 def collect_once():
-    """
-    - Gộp các message có cùng media_group_id (album) thành 1 đơn vị xử lý.
-    - Chỉ trả lời & ghi Messages 1 lần cho mỗi album.
-    - Với message lẻ (không có media_group_id) xử lý như cũ.
-    """
     offset = _meta_get("last_update_id")
     offset = int(offset) + 1 if offset else None
 
     resp = _tg("getUpdates", timeout=10, allowed_updates=["message"], offset=offset)
     updates = resp.get("result", [])
 
-    # Gom album theo media_group_id
     group_buf: Dict[str, Dict[str, Any]] = {}
     last_update_id = None
 
@@ -189,51 +178,42 @@ def collect_once():
         text = msg.get("text", "")
         caption = msg.get("caption", "")
         photos = msg.get("photo", [])
-        media_group_id = msg.get("media_group_id")  # <-- album id nếu có
+        media_group_id = msg.get("media_group_id")
 
         content = caption if caption else text
 
         if media_group_id:
             g = group_buf.get(media_group_id)
             if not g:
-                g = {
-                    "chat_id": chat_id,
-                    "rep_msg_id": message_id,     # message để reply (ưu tiên caption)
-                    "caption": None,
-                    "photo_ids": set(),            # type: Set[str]
-                }
+                g = {"chat_id": chat_id, "rep_msg_id": message_id, "caption": None, "photo_ids": set()}
                 group_buf[media_group_id] = g
-
-            # gom ảnh
             g["photo_ids"].update(_photo_unique_ids(photos))
-            # ưu tiên caption dùng cho cả album
             if content:
                 g["caption"] = content
                 g["rep_msg_id"] = message_id
-            # không xử lý ngay; đợi xử lý sau vòng lặp
             continue
 
-        # --------- Message lẻ (không album) ----------
+        # ---- Message lẻ ----
         code = _extract_code(content)
         if not code:
             _send_reply(chat_id, message_id, MSG_BADFMT)
             continue
 
-        # check trùng ảnh nếu có
         photo_ids = _photo_unique_ids(photos)
+        # Nếu ảnh trùng -> CẢNH BÁO và BỎ QUA hoàn toàn (không ghi Messages)
         if _is_duplicate_photo(photo_ids):
             _send_reply(chat_id, message_id, MSG_DUPIMG)
+            continue
 
-        # Ghi tối thiểu: Text/Caption + Code (Timestamp dùng createdTime)
         _save_message({COL_MSG_TEXT: content, COL_MSG_CODE: code})
         _save_photo_ids(code, photo_ids)
         _send_reply(chat_id, message_id, MSG_OK)
 
-    # --------- Xử lý các album đã gom ----------
+    # ---- Xử lý album đã gom ----
     for mgid, g in group_buf.items():
         chat_id = g["chat_id"]
         rep_id = g["rep_msg_id"]
-        content = g["caption"] or ""   # nếu cả album không có caption -> coi như sai format
+        content = g["caption"] or ""
         photo_ids = list(g["photo_ids"])
 
         code = _extract_code(content)
@@ -243,12 +223,13 @@ def collect_once():
 
         if _is_duplicate_photo(photo_ids):
             _send_reply(chat_id, rep_id, MSG_DUPIMG)
+            # KHÔNG ghi vào Messages để không lọt báo cáo
+            continue
 
         _save_message({COL_MSG_TEXT: content, COL_MSG_CODE: code})
         _save_photo_ids(code, photo_ids)
         _send_reply(chat_id, rep_id, MSG_OK)
 
-    # Lưu offset cuối
     if last_update_id is not None:
         _meta_set("last_update_id", str(last_update_id))
 
@@ -260,7 +241,6 @@ def _get_master_codes():
     for r in recs:
         f = r.get("fields", {})
         code = str(f.get(COL_META_CODE, "")).strip()
-        # Chỉ nhận đúng 8 số (lọc KV như 'last_update_id')
         if code and CODE8_RE.fullmatch(code):
             codes.append(code)
             name_map[code] = str(f.get(COL_META_NAME, "")).strip()
