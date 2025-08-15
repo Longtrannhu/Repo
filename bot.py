@@ -3,6 +3,7 @@ import os, re, datetime
 from typing import List, Dict, Any
 import pytz
 import requests
+from requests.exceptions import HTTPError
 from pyairtable import Api  # v3.x
 
 # ===== ENV =====
@@ -15,7 +16,7 @@ TBL_MESSAGES        = os.getenv("TBL_MESSAGES", "Messages")
 TBL_META            = os.getenv("TBL_META", "Meta")
 TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional
 
-# Tên cột (cho phép override qua ENV)
+# Tên cột (có thể override qua ENV)
 COL_MSG_TEXT        = os.getenv("COL_MSG_TEXT", "TextOrCaption")
 COL_MSG_CODE        = os.getenv("COL_MSG_CODE", "Code")
 COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")
@@ -23,17 +24,21 @@ COL_MSG_CHAT        = os.getenv("COL_MSG_CHAT", "ChatId")
 COL_MSG_USER        = os.getenv("COL_MSG_USER", "From")
 COL_MSG_TG_MSG_ID   = os.getenv("COL_MSG_TG_MSG_ID", "TelegramMessageId")
 
+# Danh sách nơi bắt buộc (Meta)
 COL_META_CODE       = os.getenv("COL_META_CODE", "MaNoi")
 COL_META_NAME       = os.getenv("COL_META_NAME", "TenNoi")
+# KV fallback (nếu bảng Meta có cột này thì dùng; nếu không có sẽ tự fallback qua MaNoi/TenNoi)
 COL_META_KEY        = os.getenv("COL_META_KEY", "Key")
 COL_META_VAL        = os.getenv("COL_META_VAL", "Value")
 
+# Bảng IMAGES (nếu dùng)
 COL_IMG_HASH        = os.getenv("COL_IMG_HASH", "FileUniqueId")
 COL_IMG_CODE        = os.getenv("COL_IMG_CODE", "Code")
 COL_IMG_DATE        = os.getenv("COL_IMG_DATE", "Date")
 
 VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 CODE_RE = re.compile(r"^(\d{8})\s*-\s*", re.UNICODE)
+CODE8_RE = re.compile(r"^\d{8}$")
 
 MSG_OK      = "🆗Đã ghi nhận báo cáo 5s ngày hôm nay"
 MSG_BADFMT  = "🆕Kiểm tra lại format và gửi báo cáo lại"
@@ -70,23 +75,53 @@ def _send_reply(chat_id: str, reply_to_message_id: int, text: str):
 def _send_markdown(chat_id: str, text: str):
     return _tg("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown")
 
-# ===== Meta KV (lưu offset getUpdates) =====
+# ===== Meta KV with graceful fallback =====
+def _kv_find(tbl, key_field: str, val_field: str, key: str):
+    formula = f"LOWER(TO_TEXT({{{key_field}}}))='{key.lower()}'"
+    return tbl.all(formula=formula), val_field
+
 def _meta_get(key: str) -> str:
     tbl = _air_table(TBL_META)
-    recs = tbl.all(
-        formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'"  # <- dùng 'formula' (v3)
-    )
-    return recs[0]["fields"].get(COL_META_VAL, "") if recs else ""
+    # Thử Key/Value trước
+    try:
+        recs, valf = _kv_find(tbl, COL_META_KEY, COL_META_VAL, key)
+        if recs:
+            return str(recs[0]["fields"].get(valf, ""))
+    except HTTPError:
+        pass
+    # Fallback dùng MaNoi/TenNoi
+    try:
+        recs, valf = _kv_find(tbl, COL_META_CODE, COL_META_NAME, key)
+        if recs:
+            return str(recs[0]["fields"].get(valf, ""))
+    except HTTPError:
+        pass
+    return ""
 
 def _meta_set(key: str, val: str):
     tbl = _air_table(TBL_META)
-    recs = tbl.all(
-        formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'"
-    )
-    if recs:
-        tbl.update(recs[0]["id"], {COL_META_VAL: val})
-    else:
-        tbl.create({COL_META_KEY: key, COL_META_VAL: val})
+    # 1) Thử update theo cặp Key/Value
+    try:
+        recs, valf = _kv_find(tbl, COL_META_KEY, COL_META_VAL, key)
+        if recs:
+            tbl.update(recs[0]["id"], {valf: val}); return
+    except HTTPError:
+        recs = []
+    # 2) Thử update theo cặp MaNoi/TenNoi
+    try:
+        recs, valf = _kv_find(tbl, COL_META_CODE, COL_META_NAME, key)
+        if recs:
+            tbl.update(recs[0]["id"], {valf: val}); return
+    except HTTPError:
+        recs = []
+    # 3) Tạo mới: ưu tiên Key/Value; nếu không thể, tạo bằng MaNoi/TenNoi
+    for kf, vf in [(COL_META_KEY, COL_META_VAL), (COL_META_CODE, COL_META_NAME)]:
+        try:
+            tbl.create({kf: key, vf: val}); return
+        except HTTPError:
+            continue
+    # Nếu vẫn không được thì bỏ qua (không chặn collector)
+    return
 
 # ===== Collector (15') =====
 def _extract_code(text: str) -> str:
@@ -108,9 +143,12 @@ def _is_duplicate_photo(ids: List[str]) -> bool:
         return False
     tbl = _air_table(TBL_IMAGES)
     for uid in ids:
-        recs = tbl.all(formula=f"{{{COL_IMG_HASH}}} = '{uid}'")  # <- formula
-        if recs:
-            return True
+        try:
+            recs = tbl.all(formula=f"{{{COL_IMG_HASH}}} = '{uid}'")
+            if recs:
+                return True
+        except HTTPError:
+            continue
     return False
 
 def _save_photo_ids(code: str, ids: List[str]):
@@ -168,7 +206,6 @@ def collect_once():
         }
         _save_message(record)
         _save_photo_ids(code, photo_ids)
-
         _send_reply(chat_id, message_id, MSG_OK)
 
     if last_id is not None:
@@ -182,7 +219,8 @@ def _get_master_codes():
     for r in recs:
         f = r.get("fields", {})
         code = str(f.get(COL_META_CODE, "")).strip()
-        if code:
+        # Chỉ chấp nhận đúng 8 số (lọc bỏ dòng KV như 'last_update_id')
+        if code and CODE8_RE.fullmatch(code):
             codes.append(code)
             name_map[code] = str(f.get(COL_META_NAME, "")).strip()
     return codes, name_map
