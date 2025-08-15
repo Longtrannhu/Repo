@@ -2,8 +2,9 @@
 # - Gộp album theo media_group_id
 # - Chống trùng ảnh (Images table) + fallback chống trùng caption trong ngày
 # - Chỉ cảnh báo 1 lần/caption TRONG CẢ NGÀY (persist vào Meta)
-# - Báo cáo 21h dùng HTML (escape + tự cắt khi dài)
-# - Tránh spam: chỉ 1 cảnh báo/caption/phiên + không lặp ở phiên sau
+# - KHÔNG reply lại cùng Telegram message: lưu seen message_ids theo ngày (persist)
+# - Báo cáo 21h dùng HTML (escape + auto split)
+# - Tránh spam
 
 import os, re, datetime, hashlib
 from typing import List, Dict, Any, Set
@@ -25,7 +26,7 @@ TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional: bật ch�
 # Tên cột Messages (có thể override qua ENV)
 COL_MSG_TEXT        = os.getenv("COL_MSG_TEXT", "TextOrCaption")
 COL_MSG_CODE        = os.getenv("COL_MSG_CODE", "Code")
-COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")  # chỉ dùng khi ĐỌC
+COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")  # chỉ dùng khi đọc
 
 # Danh sách nơi bắt buộc (Meta)
 COL_META_CODE       = os.getenv("COL_META_CODE", "MaNoi")
@@ -76,10 +77,9 @@ def _send_reply(chat_id: str, reply_to_message_id: int, text: str):
                allow_sending_without_reply=True)
 
 def _send_markdown(chat_id: str, text: str):
-    # Giữ lại nếu muốn dùng chỗ khác (báo cáo dùng HTML)
     return _tg("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown")
 
-# ---- HTML helpers (an toàn, tránh 400 Bad Request) ----
+# ---- HTML helpers ----
 def _html_escape(s: str) -> str:
     if s is None:
         return ""
@@ -92,7 +92,6 @@ def _send_html(chat_id: str, html: str):
     return _tg("sendMessage", chat_id=chat_id, text=html, parse_mode="HTML")
 
 def _send_long_html(chat_id: str, html: str, limit: int = 3900):
-    """Telegram limit ~4096. Cắt theo dòng và gửi nhiều phần."""
     text = html
     while len(text) > limit:
         cut = text.rfind("\n", 0, limit)
@@ -145,9 +144,12 @@ def _meta_set(key: str, val: str):
             continue
     return
 
-# ===== Warned captions (persist theo ngày) =====
+# ===== Persisted sets (warned caps & seen message_ids) =====
 def _warn_key_today() -> str:
     return f"warn_caps_{_today_vn().strftime('%Y%m%d')}"
+
+def _seen_key_today() -> str:
+    return f"seen_msgids_{_today_vn().strftime('%Y%m%d')}"
 
 def _parse_hash_list(s: str) -> Set[str]:
     out = set()
@@ -162,11 +164,30 @@ def _serialize_hash_list(vals: Set[str]) -> str:
         return ""
     return ",".join(sorted(vals))[:9000]
 
+def _parse_id_list(s: str) -> Set[int]:
+    out: Set[int] = set()
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if tok.isdigit():
+            out.add(int(tok))
+    return out
+
+def _serialize_id_list(vals: Set[int]) -> str:
+    if not vals:
+        return ""
+    return ",".join(str(x) for x in sorted(vals))[:9000]
+
 def _load_warned_caps_persist() -> Set[str]:
     return _parse_hash_list(_meta_get(_warn_key_today()))
 
 def _save_warned_caps_persist(vals: Set[str]):
     _meta_set(_warn_key_today(), _serialize_hash_list(vals))
+
+def _load_seen_msgids_persist() -> Set[int]:
+    return _parse_id_list(_meta_get(_seen_key_today()))
+
+def _save_seen_msgids_persist(vals: Set[int]):
+    _meta_set(_seen_key_today(), _serialize_id_list(vals))
 
 # ===== Dedup helpers (ảnh/caption) =====
 def _photo_unique_ids(photo_sizes: List[Dict[str,Any]]) -> List[str]:
@@ -209,16 +230,12 @@ def _hash_caption(text: str) -> str:
     return hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()
 
 def _load_today_caption_hashes() -> Set[str]:
-    """
-    Trả về tập hash (SHA1) của caption đã ĐƯỢC LƯU trong bảng Messages trong NGÀY HÔM NAY.
-    Dùng để chặn gửi trùng theo caption (fallback khi không có table Images).
-    """
+    """Hash của caption đã LƯU vào bảng Messages trong NGÀY HÔM NAY."""
     tbl = _air_table(TBL_MESSAGES)
     try:
         recs = tbl.all(fields=[COL_MSG_TEXT])
     except HTTPError:
         return set()
-
     today = _today_vn()
     hashes: Set[str] = set()
     for r in recs:
@@ -233,7 +250,7 @@ def _load_today_caption_hashes() -> Set[str]:
             hashes.add(h)
     return hashes
 
-# ===== Collector (15') — GỘP ALBUM & DEDUP & PERSIST WARN =====
+# ===== Collector (*/15) — gộp album, dedup, persist warn & seen =====
 def _extract_code(text: str) -> str:
     if not text:
         return ""
@@ -246,9 +263,10 @@ def collect_once():
 
     # bộ nhớ trùng
     seen_uids = _load_seen_uids()
-    seen_caps_day = _load_today_caption_hashes()       # caption đã LƯU trong ngày
-    warned_caps_day = _load_warned_caps_persist()      # caption đã CẢNH BÁO trong ngày (persist)
-    warned_caps_session: Set[str] = set()              # caption cảnh báo trong phiên (chống spam)
+    seen_caps_day = _load_today_caption_hashes()     # caption đã LƯU trong ngày
+    warned_caps_day = _load_warned_caps_persist()    # caption đã CẢNH BÁO trong ngày
+    seen_msgids_day = _load_seen_msgids_persist()    # message_id đã xử lý trong ngày
+    warned_caps_session: Set[str] = set()            # cảnh báo trong phiên (chống spam)
 
     def should_warn(ch: str) -> bool:
         return ch not in warned_caps_day and ch not in warned_caps_session
@@ -258,7 +276,7 @@ def collect_once():
 
     group_buf: Dict[str, Dict[str, Any]] = {}
     last_update_id = None
-    persist_dirty = False
+    persist_dirty = False   # có thay đổi vào warned/seen persist?
 
     for u in updates:
         last_update_id = u.get("update_id", last_update_id)
@@ -268,7 +286,11 @@ def collect_once():
         if not chat_id or chat_id != str(TELEGRAM_CHAT_ID):
             continue
 
-        message_id = msg.get("message_id")
+        message_id = int(msg.get("message_id"))
+        if message_id in seen_msgids_day:
+            # ĐÃ xử lý message này ở lần chạy trước -> bỏ qua tuyệt đối
+            continue
+
         text = msg.get("text", "")
         caption = msg.get("caption", "")
         photos = msg.get("photo", [])
@@ -280,9 +302,11 @@ def collect_once():
         if media_group_id:
             g = group_buf.get(media_group_id)
             if not g:
-                g = {"chat_id": chat_id, "rep_msg_id": message_id, "caption": None, "photo_ids": set()}
+                g = {"chat_id": chat_id, "rep_msg_id": message_id, "caption": None,
+                     "photo_ids": set(), "msg_ids": set()}
                 group_buf[media_group_id] = g
             g["photo_ids"].update(_photo_unique_ids(photos))
+            g["msg_ids"].add(message_id)
             if content:
                 g["caption"] = content
                 g["rep_msg_id"] = message_id
@@ -298,17 +322,20 @@ def collect_once():
                 warned_caps_session.add(ch)
                 warned_caps_day.add(ch)
                 persist_dirty = True
+            # Dù cảnh báo hay không, đánh dấu đã xử lý message này
+            seen_msgids_day.add(message_id); persist_dirty = True
             continue
 
         photo_ids = _photo_unique_ids(photos)
 
-        # Trùng ảnh hoặc caption -> cảnh báo 1 lần/ngày
+        # Trùng ảnh/caption -> cảnh báo 1 lần/ngày
         if _is_duplicate_photo(photo_ids, seen_uids) or ch in seen_caps_day or ch in warned_caps_day:
             if content and should_warn(ch):
                 _send_reply(chat_id, message_id, MSG_DUPIMG)
                 warned_caps_session.add(ch)
                 warned_caps_day.add(ch)
                 persist_dirty = True
+            seen_msgids_day.add(message_id); persist_dirty = True
             continue
 
         # Lưu message hợp lệ
@@ -316,6 +343,7 @@ def collect_once():
         _save_photo_ids(code, photo_ids, seen_uids)
         seen_caps_day.add(ch)
         _send_reply(chat_id, message_id, MSG_OK)
+        seen_msgids_day.add(message_id); persist_dirty = True
 
     # ---- Xử lý album ----
     for mgid, g in group_buf.items():
@@ -323,6 +351,11 @@ def collect_once():
         rep_id = g["rep_msg_id"]
         content = g["caption"] or ""
         photo_ids = list(g["photo_ids"])
+        msg_ids = g["msg_ids"]
+
+        # Nếu TẤT CẢ message của album đã xử lý trước đó -> bỏ qua luôn
+        if msg_ids and all(mid in seen_msgids_day for mid in msg_ids):
+            continue
 
         ch = _hash_caption(content) if content else ""
         code = _extract_code(content)
@@ -333,6 +366,7 @@ def collect_once():
                 warned_caps_session.add(ch)
                 warned_caps_day.add(ch)
                 persist_dirty = True
+            seen_msgids_day.update(msg_ids); persist_dirty = True
             continue
 
         if _is_duplicate_photo(photo_ids, seen_uids) or ch in seen_caps_day or ch in warned_caps_day:
@@ -341,18 +375,21 @@ def collect_once():
                 warned_caps_session.add(ch)
                 warned_caps_day.add(ch)
                 persist_dirty = True
+            seen_msgids_day.update(msg_ids); persist_dirty = True
             continue
 
         _air_table(TBL_MESSAGES).create({COL_MSG_TEXT: content, COL_MSG_CODE: code})
         _save_photo_ids(code, photo_ids, seen_uids)
         seen_caps_day.add(ch)
         _send_reply(chat_id, rep_id, MSG_OK)
+        seen_msgids_day.update(msg_ids); persist_dirty = True
 
-    # Lưu offset & warned caps persist
+    # Lưu offset & persist sets
     if last_update_id is not None:
         _meta_set("last_update_id", str(last_update_id))
     if persist_dirty:
         _save_warned_caps_persist(warned_caps_day)
+        _save_seen_msgids_persist(seen_msgids_day)
 
 # ===== Daily report (21h) =====
 def _get_master_codes():
