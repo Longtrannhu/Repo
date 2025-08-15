@@ -1,9 +1,9 @@
-# bot.py
+# bot.py  — compatible with pyairtable 3.x
 import os, re, datetime
 from typing import List, Dict, Any
 import pytz
 import requests
-from pyairtable import Table
+from pyairtable import Api  # v3.x
 
 # ================== ENV & CONST ==================
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
@@ -13,9 +13,9 @@ AIRTABLE_TOKEN      = os.getenv("AIRTABLE_TOKEN")
 AIRTABLE_BASE_ID    = os.getenv("AIRTABLE_BASE_ID")
 TBL_MESSAGES        = os.getenv("TBL_MESSAGES", "Messages")
 TBL_META            = os.getenv("TBL_META", "Meta")
-TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional (nếu muốn check trùng ảnh)
+TBL_IMAGES          = os.getenv("TBL_IMAGES", "").strip()  # optional
 
-# Tên cột trong Airtable (cho phép override qua ENV để khớp schema hiện tại)
+# Tên cột trong Airtable (có thể override qua ENV để khớp schema hiện tại)
 COL_MSG_TEXT        = os.getenv("COL_MSG_TEXT", "TextOrCaption")
 COL_MSG_CODE        = os.getenv("COL_MSG_CODE", "Code")
 COL_MSG_TS          = os.getenv("COL_MSG_TS", "Timestamp")  # nếu không có, sẽ dùng createdTime
@@ -41,6 +41,12 @@ MSG_OK      = "🆗Đã ghi nhận báo cáo 5s ngày hôm nay"
 MSG_BADFMT  = "🆕Kiểm tra lại format và gửi báo cáo lại"
 MSG_DUPIMG  = "⛔️Ảnh gửi có dấu hiệu trùng với trước đây, nhờ kiểm tra lại"
 
+# ================== Airtable API (v3) ==================
+_api = Api(AIRTABLE_TOKEN)
+
+def _air_table(name: str):
+    return _api.table(AIRTABLE_BASE_ID, name)
+
 # ================== Helpers ==================
 def _today_vn():
     return datetime.datetime.now(VN_TZ).date()
@@ -52,9 +58,6 @@ def _iso_local(dttm):
         except Exception:
             return None
     return dttm
-
-def _air_table(name):
-    return Table(AIRTABLE_TOKEN, AIRTABLE_BASE_ID, name)
 
 def _tg(method: str, **kwargs):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
@@ -78,12 +81,16 @@ def _send_markdown(chat_id: str, text: str):
 # ================== Meta KV (lưu offset getUpdates) ==================
 def _meta_get(key: str) -> str:
     tbl = _air_table(TBL_META)
-    recs = tbl.all(formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'".format(COL_META_KEY=COL_META_KEY))
+    recs = tbl.all(
+        filter_by_formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'".format(COL_META_KEY=COL_META_KEY)
+    )
     return recs[0]["fields"].get(COL_META_VAL, "") if recs else ""
 
 def _meta_set(key: str, val: str):
     tbl = _air_table(TBL_META)
-    recs = tbl.all(formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'".format(COL_META_KEY=COL_META_KEY))
+    recs = tbl.all(
+        filter_by_formula=f"LOWER({{{COL_META_KEY}}})='{key.lower()}'".format(COL_META_KEY=COL_META_KEY)
+    )
     if recs:
         tbl.update(recs[0]["id"], {COL_META_VAL: val})
     else:
@@ -109,7 +116,7 @@ def _is_duplicate_photo(ids: List[str]) -> bool:
         return False
     tbl = _air_table(TBL_IMAGES)
     for uid in ids:
-        recs = tbl.all(formula=f"{{{COL_IMG_HASH}}} = '{uid}'")
+        recs = tbl.all(filter_by_formula=f"{{{COL_IMG_HASH}}} = '{uid}'")
         if recs:
             return True
     return False
