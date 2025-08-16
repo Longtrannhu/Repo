@@ -1,12 +1,13 @@
 # bot.py — Telegram collector + 21h report (Airtable, pyairtable 3.x)
 # - Gộp album theo media_group_id
 # - Chống trùng ảnh (Images table) + fallback chống trùng caption trong ngày
-# - Chỉ cảnh báo 1 lần/caption TRONG CẢ NGÀY (persist vào Meta)
+# - Cảnh báo 1 lần/caption TRONG NGÀY (persist vào Meta)
 # - KHÔNG reply lại cùng Telegram message: lưu seen message_ids theo ngày (persist)
 # - Khoá tránh chạy trùng collector (lock với TTL trong Meta)
 # - BỎ QUA tin nhắn do bot gửi (from.is_bot = True)
 # - ACK hàng đợi Telegram TRƯỚC khi xử lý (getUpdates offset=max+1)
 # - Báo cáo 21h dùng HTML (escape + auto split)
+# - ĐÃ đổi tiêu đề phần 1 thành: "Các Kho đã gửi báo cáo"
 
 import os, re, time, datetime, hashlib
 from typing import List, Dict, Any, Set
@@ -518,7 +519,7 @@ def run_daily_report():
         f"<b>Tổng quan:</b> Tổng <code>{total}</code> • ✅ Đã gửi <code>{sent}</code> • "
         f"❌ Thiếu <code>{miss}</code> • 📈 {pct}% đã gửi\n\n"
     )
-    body1 = f"<b>1) Text/Caption đã gửi ({sent}):</b>\n" + "\n".join(sent_lines) + "\n\n"
+    body1 = f"<b>1) Các Kho đã gửi báo cáo ({sent}):</b>\n" + "\n".join(sent_lines) + "\n\n"
     body2 = f"<b>2) Những nơi chưa gửi ({miss}):</b>\n" + "\n".join(miss_lines)
     html_msg = header + body1 + body2
 
