@@ -5,7 +5,7 @@
 # - KHÔNG reply lại cùng Telegram message: lưu seen message_ids theo ngày (persist)
 # - Khoá tránh chạy trùng collector (lock với TTL trong Meta)
 # - BỎ QUA tin nhắn do bot gửi (from.is_bot = True)
-# - ACK hàng đợi Telegram sau khi xử lý (getUpdates offset=last+1)
+# - ACK hàng đợi Telegram TRƯỚC khi xử lý (getUpdates offset=max+1)
 # - Báo cáo 21h dùng HTML (escape + auto split)
 
 import os, re, time, datetime, hashlib
@@ -196,6 +196,7 @@ def _lock_key() -> str:
     return "lock_collector"
 
 def _acquire_lock(ttl_sec: int = 180) -> bool:
+    """True nếu chiếm được lock; False nếu đang có lock còn hạn."""
     now = int(time.time())
     raw = _meta_get(_lock_key())
     try:
@@ -271,7 +272,7 @@ def _load_today_caption_hashes() -> Set[str]:
             hashes.add(h)
     return hashes
 
-# ===== Collector (*/15) — gộp album, dedup, persist warn & seen, lock, ACK =====
+# ===== Collector (*/15) — gộp album, dedup, persist warn & seen, lock, ACK trước =====
 def _extract_code(text: str) -> str:
     if not text:
         return ""
@@ -283,32 +284,47 @@ def collect_once():
     if not _acquire_lock(ttl_sec=180):
         return
     try:
+        # 1) Đọc offset hiện tại
         offset = _meta_get("last_update_id")
         offset = int(offset) + 1 if offset else None
 
-        # bộ nhớ trùng
-        seen_uids = _load_seen_uids()
-        seen_caps_day = _load_today_caption_hashes()     # caption đã LƯU trong ngày
-        warned_caps_day = _load_warned_caps_persist()    # caption đã CẢNH BÁO trong ngày
-        seen_msgids_day = _load_seen_msgids_persist()    # message_id đã xử lý trong ngày
-        warned_caps_session: Set[str] = set()            # cảnh báo trong phiên (chống spam)
-
-        def should_warn(ch: str) -> bool:
-            return ch not in warned_caps_day and ch not in warned_caps_session
-
+        # 2) Kéo tất cả updates kể từ offset
         resp = _tg("getUpdates", timeout=10, allowed_updates=["message"], offset=offset)
         updates = resp.get("result", [])
 
-        group_buf: Dict[str, Dict[str, Any]] = {}
-        last_update_id = None
-        persist_dirty = False   # có thay đổi vào warned/seen persist?
-
+        # 3) ACK HÀNG ĐỢI TRƯỚC: nếu có update, đẩy offset lên max+1 (xoá update cũ khỏi server)
+        max_uid = None
         for u in updates:
-            last_update_id = u.get("update_id", last_update_id)
+            uid = u.get("update_id")
+            if isinstance(uid, int):
+                max_uid = uid if max_uid is None else max(max_uid, uid)
+        if max_uid is not None:
+            _meta_set("last_update_id", str(max_uid))
+            try:
+                _tg("getUpdates", offset=max_uid + 1, timeout=0)
+            except Exception:
+                pass
+
+        # 4) Chuẩn bị bộ nhớ chống trùng trong ngày
+        seen_uids        = _load_seen_uids()
+        seen_caps_day    = _load_today_caption_hashes()
+        warned_caps_day  = _load_warned_caps_persist()
+        seen_msgids_day  = _load_seen_msgids_persist()
+        warned_session: Set[str] = set()
+
+        def should_warn(ch: str) -> bool:
+            return ch not in warned_caps_day and ch not in warned_session
+
+        # 5) Bộ đệm gộp album
+        group_buf: Dict[str, Dict[str, Any]] = {}
+        persist_dirty = False
+
+        # 6) Duyệt & gom theo album
+        for u in updates:
             msg = u.get("message") or {}
             frm = msg.get("from", {}) or {}
             if frm.get("is_bot"):
-                # BỎ QUA mọi tin nhắn do bot gửi (tránh loop / replay)
+                # Bỏ qua tin nhắn do bot gửi
                 continue
 
             chat = msg.get("chat", {})
@@ -318,17 +334,15 @@ def collect_once():
 
             message_id = int(msg.get("message_id"))
             if message_id in seen_msgids_day:
-                # ĐÃ xử lý message này ở phiên trước -> bỏ qua tuyệt đối
+                # đã xử lý trước đó -> bỏ qua tuyệt đối
                 continue
 
             text = msg.get("text", "")
             caption = msg.get("caption", "")
             photos = msg.get("photo", [])
             media_group_id = msg.get("media_group_id")
-
             content = caption if caption else text
 
-            # Gom album
             if media_group_id:
                 g = group_buf.get(media_group_id)
                 if not g:
@@ -343,56 +357,52 @@ def collect_once():
                 continue
 
             # ---- Message lẻ ----
-            ch = _hash_caption(content) if content else ""
+            ch   = _hash_caption(content) if content else ""
             code = _extract_code(content)
 
             if not code:
                 if content and should_warn(ch):
                     _send_reply(chat_id, message_id, MSG_BADFMT)
-                    warned_caps_session.add(ch)
+                    warned_session.add(ch)
                     warned_caps_day.add(ch)
                     persist_dirty = True
                 seen_msgids_day.add(message_id); persist_dirty = True
                 continue
 
             photo_ids = _photo_unique_ids(photos)
-
-            # Trùng ảnh/caption -> cảnh báo 1 lần/ngày
             if _is_duplicate_photo(photo_ids, seen_uids) or ch in seen_caps_day or ch in warned_caps_day:
                 if content and should_warn(ch):
                     _send_reply(chat_id, message_id, MSG_DUPIMG)
-                    warned_caps_session.add(ch)
+                    warned_session.add(ch)
                     warned_caps_day.add(ch)
                     persist_dirty = True
                 seen_msgids_day.add(message_id); persist_dirty = True
                 continue
 
-            # Lưu message hợp lệ
             _air_table(TBL_MESSAGES).create({COL_MSG_TEXT: content, COL_MSG_CODE: code})
             _save_photo_ids(code, photo_ids, seen_uids)
             seen_caps_day.add(ch)
             _send_reply(chat_id, message_id, MSG_OK)
             seen_msgids_day.add(message_id); persist_dirty = True
 
-        # ---- Xử lý album ----
+        # 7) Xử lý album đã gom
         for mgid, g in group_buf.items():
-            chat_id = g["chat_id"]
-            rep_id = g["rep_msg_id"]
-            content = g["caption"] or ""
+            chat_id  = g["chat_id"]
+            rep_id   = g["rep_msg_id"]
+            content  = g["caption"] or ""
             photo_ids = list(g["photo_ids"])
-            msg_ids = g["msg_ids"]
+            msg_ids   = g["msg_ids"]
 
-            # Nếu TẤT CẢ message của album đã xử lý trước đó -> bỏ qua luôn
             if msg_ids and all(mid in seen_msgids_day for mid in msg_ids):
                 continue
 
-            ch = _hash_caption(content) if content else ""
+            ch   = _hash_caption(content) if content else ""
             code = _extract_code(content)
 
             if not code:
                 if content and should_warn(ch):
                     _send_reply(chat_id, rep_id, MSG_BADFMT)
-                    warned_caps_session.add(ch)
+                    warned_session.add(ch)
                     warned_caps_day.add(ch)
                     persist_dirty = True
                 seen_msgids_day.update(msg_ids); persist_dirty = True
@@ -401,7 +411,7 @@ def collect_once():
             if _is_duplicate_photo(photo_ids, seen_uids) or ch in seen_caps_day or ch in warned_caps_day:
                 if content and should_warn(ch):
                     _send_reply(chat_id, rep_id, MSG_DUPIMG)
-                    warned_caps_session.add(ch)
+                    warned_session.add(ch)
                     warned_caps_day.add(ch)
                     persist_dirty = True
                 seen_msgids_day.update(msg_ids); persist_dirty = True
@@ -413,14 +423,7 @@ def collect_once():
             _send_reply(chat_id, rep_id, MSG_OK)
             seen_msgids_day.update(msg_ids); persist_dirty = True
 
-        # Lưu offset & persist sets
-        if last_update_id is not None:
-            # ACK hàng đợi Telegram NGAY LẬP TỨC để xoá update cũ khỏi server
-            try:
-                _tg("getUpdates", offset=last_update_id + 1, timeout=0)
-            except Exception:
-                pass
-            _meta_set("last_update_id", str(last_update_id))
+        # 8) Lưu lại các set persist trong ngày
         if persist_dirty:
             _save_warned_caps_persist(warned_caps_day)
             _save_seen_msgids_persist(seen_msgids_day)
