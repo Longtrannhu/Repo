@@ -1,13 +1,13 @@
 # bot.py — Telegram collector + 21h report (Airtable, pyairtable 3.x)
 # - Gộp album theo media_group_id
-# - Chống trùng ảnh (Images table) + fallback chống trùng caption trong ngày
+# - Chống trùng ảnh (Images table) + chống trùng caption trong ngày
 # - Cảnh báo 1 lần/caption TRONG NGÀY (persist vào Meta)
-# - KHÔNG reply lại cùng Telegram message: lưu seen message_ids theo ngày (persist)
+# - Không reply lại cùng Telegram message: lưu seen message_ids theo ngày (persist)
 # - Khoá tránh chạy trùng collector (lock với TTL trong Meta)
-# - BỎ QUA tin nhắn do bot gửi (from.is_bot = True)
+# - Bỏ qua tin nhắn do bot gửi (from.is_bot = True)
 # - ACK hàng đợi Telegram TRƯỚC khi xử lý (getUpdates offset=max+1)
-# - Báo cáo 21h dùng HTML (escape + auto split)
-# - ĐÃ đổi tiêu đề phần 1 thành: "Các Kho đã gửi báo cáo"
+# - Reply an toàn: kèm message_thread_id (nếu có), fallback gửi thường khi 400 Bad Request
+# - Báo cáo 21h dùng HTML (escape + auto split) — mục 1: “Các Kho đã gửi báo cáo”
 
 import os, re, time, datetime, hashlib
 from typing import List, Dict, Any, Set
@@ -71,13 +71,41 @@ def _iso_local(dttm):
 def _tg(method: str, **kwargs):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     r = requests.post(url, json=kwargs, timeout=30)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        # Hiển thị thông tin lỗi từ Telegram để dễ debug
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise requests.exceptions.HTTPError(
+            f"{e} | Telegram said: {detail}"
+        ) from e
     return r.json()
 
-def _send_reply(chat_id: str, reply_to_message_id: int, text: str):
-    return _tg("sendMessage", chat_id=chat_id, text=text,
-               reply_to_message_id=reply_to_message_id,
-               allow_sending_without_reply=True)
+def _send_reply(chat_id: str, reply_to_message_id: int, text: str, thread_id: int | None = None):
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "allow_sending_without_reply": True,
+    }
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = reply_to_message_id
+    if thread_id is not None:
+        payload["message_thread_id"] = thread_id
+
+    try:
+        return _tg("sendMessage", **payload)
+    except requests.exceptions.HTTPError as e:
+        # Nếu reply lỗi 400 (message không tồn tại/không cho reply), gửi thường để không fail job
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 400:
+            fallback = {"chat_id": chat_id, "text": text}
+            if thread_id is not None:
+                fallback["message_thread_id"] = thread_id
+            return _tg("sendMessage", **fallback)
+        raise
 
 def _send_markdown(chat_id: str, text: str):
     return _tg("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown")
@@ -273,7 +301,7 @@ def _load_today_caption_hashes() -> Set[str]:
             hashes.add(h)
     return hashes
 
-# ===== Collector (*/15) — gộp album, dedup, persist warn & seen, lock, ACK trước =====
+# ===== Collector (*/15) — ACK trước, gộp album, dedup, persist warn & seen =====
 def _extract_code(text: str) -> str:
     if not text:
         return ""
@@ -316,7 +344,7 @@ def collect_once():
         def should_warn(ch: str) -> bool:
             return ch not in warned_caps_day and ch not in warned_session
 
-        # 5) Bộ đệm gộp album
+        # 5) Bộ đệm gộp album (thêm thread_id)
         group_buf: Dict[str, Dict[str, Any]] = {}
         persist_dirty = False
 
@@ -325,7 +353,6 @@ def collect_once():
             msg = u.get("message") or {}
             frm = msg.get("from", {}) or {}
             if frm.get("is_bot"):
-                # Bỏ qua tin nhắn do bot gửi
                 continue
 
             chat = msg.get("chat", {})
@@ -335,26 +362,34 @@ def collect_once():
 
             message_id = int(msg.get("message_id"))
             if message_id in seen_msgids_day:
-                # đã xử lý trước đó -> bỏ qua tuyệt đối
                 continue
 
             text = msg.get("text", "")
             caption = msg.get("caption", "")
             photos = msg.get("photo", [])
             media_group_id = msg.get("media_group_id")
+            thread_id = msg.get("message_thread_id")  # <<=== forum topic id nếu có
             content = caption if caption else text
 
             if media_group_id:
                 g = group_buf.get(media_group_id)
                 if not g:
-                    g = {"chat_id": chat_id, "rep_msg_id": message_id, "caption": None,
-                         "photo_ids": set(), "msg_ids": set()}
+                    g = {
+                        "chat_id": chat_id,
+                        "rep_msg_id": message_id,
+                        "caption": None,
+                        "photo_ids": set(),
+                        "msg_ids": set(),
+                        "thread_id": thread_id,
+                    }
                     group_buf[media_group_id] = g
                 g["photo_ids"].update(_photo_unique_ids(photos))
                 g["msg_ids"].add(message_id)
                 if content:
                     g["caption"] = content
                     g["rep_msg_id"] = message_id
+                if g.get("thread_id") is None and thread_id is not None:
+                    g["thread_id"] = thread_id
                 continue
 
             # ---- Message lẻ ----
@@ -363,7 +398,7 @@ def collect_once():
 
             if not code:
                 if content and should_warn(ch):
-                    _send_reply(chat_id, message_id, MSG_BADFMT)
+                    _send_reply(chat_id, message_id, MSG_BADFMT, thread_id=thread_id)
                     warned_session.add(ch)
                     warned_caps_day.add(ch)
                     persist_dirty = True
@@ -373,7 +408,7 @@ def collect_once():
             photo_ids = _photo_unique_ids(photos)
             if _is_duplicate_photo(photo_ids, seen_uids) or ch in seen_caps_day or ch in warned_caps_day:
                 if content and should_warn(ch):
-                    _send_reply(chat_id, message_id, MSG_DUPIMG)
+                    _send_reply(chat_id, message_id, MSG_DUPIMG, thread_id=thread_id)
                     warned_session.add(ch)
                     warned_caps_day.add(ch)
                     persist_dirty = True
@@ -383,16 +418,17 @@ def collect_once():
             _air_table(TBL_MESSAGES).create({COL_MSG_TEXT: content, COL_MSG_CODE: code})
             _save_photo_ids(code, photo_ids, seen_uids)
             seen_caps_day.add(ch)
-            _send_reply(chat_id, message_id, MSG_OK)
+            _send_reply(chat_id, message_id, MSG_OK, thread_id=thread_id)
             seen_msgids_day.add(message_id); persist_dirty = True
 
         # 7) Xử lý album đã gom
         for mgid, g in group_buf.items():
-            chat_id  = g["chat_id"]
-            rep_id   = g["rep_msg_id"]
-            content  = g["caption"] or ""
+            chat_id   = g["chat_id"]
+            rep_id    = g["rep_msg_id"]
+            content   = g["caption"] or ""
             photo_ids = list(g["photo_ids"])
             msg_ids   = g["msg_ids"]
+            thread_id = g.get("thread_id")
 
             if msg_ids and all(mid in seen_msgids_day for mid in msg_ids):
                 continue
@@ -402,7 +438,7 @@ def collect_once():
 
             if not code:
                 if content and should_warn(ch):
-                    _send_reply(chat_id, rep_id, MSG_BADFMT)
+                    _send_reply(chat_id, rep_id, MSG_BADFMT, thread_id=thread_id)
                     warned_session.add(ch)
                     warned_caps_day.add(ch)
                     persist_dirty = True
@@ -411,7 +447,7 @@ def collect_once():
 
             if _is_duplicate_photo(photo_ids, seen_uids) or ch in seen_caps_day or ch in warned_caps_day:
                 if content and should_warn(ch):
-                    _send_reply(chat_id, rep_id, MSG_DUPIMG)
+                    _send_reply(chat_id, rep_id, MSG_DUPIMG, thread_id=thread_id)
                     warned_session.add(ch)
                     warned_caps_day.add(ch)
                     persist_dirty = True
@@ -421,7 +457,7 @@ def collect_once():
             _air_table(TBL_MESSAGES).create({COL_MSG_TEXT: content, COL_MSG_CODE: code})
             _save_photo_ids(code, photo_ids, seen_uids)
             seen_caps_day.add(ch)
-            _send_reply(chat_id, rep_id, MSG_OK)
+            _send_reply(chat_id, rep_id, MSG_OK, thread_id=thread_id)
             seen_msgids_day.update(msg_ids); persist_dirty = True
 
         # 8) Lưu lại các set persist trong ngày
